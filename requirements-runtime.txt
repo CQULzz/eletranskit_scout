@@ -1,0 +1,4 @@
+# CuPy is intentionally omitted: install the build matching the target CUDA/JetPack.
+simple-parsing==0.1.9
+ruamel.yaml>=0.17,<0.20
+shapely>=1.8,<3

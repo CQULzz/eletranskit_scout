@@ -1,0 +1,39 @@
+/elevation_mapping_node:
+  ros__parameters:
+    map_frame: odom
+    corrected_map_frame: odom
+    base_frame: FP_POI
+    initialize_frame_id: [FP_POI]
+
+    # Remove the rectangular vehicle-body return in the LiDAR frame.
+    # Bounds are inclusive and apply to all Z values.
+    self_filter_enabled: true
+    self_filter_min_x: -1.0
+    self_filter_max_x: 0.0
+    self_filter_min_y: -0.5
+    self_filter_max_y: 0.5
+
+    # Every fused cloud updates a logically unbounded sparse tile map. The
+    # finite GridMap topic is only a detailed view; tiles remain on disk.
+    enable_global_map: true
+    global_map_storage_path: '~/.ros/elevation_mapping_cupy/global_tiles.sqlite3'
+    global_map_resume_from_disk: false
+    global_map_view_length_x: 30.0
+    global_map_view_length_y: 30.0
+    global_map_view_follow_robot: false
+
+    subscribers:
+      lidar:
+        topic_name: /rslidar_points
+        data_type: pointcloud
+
+    publishers:
+      elevation_map_raw:
+        layers: [elevation, traversability, variance]
+        basic_layers: [elevation]
+        fps: 10.0
+
+      elevation_map_filter:
+        layers: [min_filter, smooth, near_base_filtered, despiked, inpaint, elevation]
+        basic_layers: [min_filter, smooth, near_base_filtered, despiked, inpaint]
+        fps: 10.0
