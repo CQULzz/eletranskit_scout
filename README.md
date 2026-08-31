@@ -1,10 +1,14 @@
-# ele_scout_kit
+# eletranskit_scout
 
-面向当前实车的完整 ROS 2 Humble 工作区。仓库本身已经包含运行所需的程序
-源码，不再依赖 `/home/agx/fp`、`/home/agx/rslidar_sdk`、
-`/home/agx/elevation_map_cupy` 或 Autoware 工作区。
+面向当前 Scout 实车的完整 ROS 2 Humble 工作区。仓库已经内置运行所需的
+ROS 包、实车配置、RViz 配置、HT 可通过性节点和模型权重，不再依赖
+`/home/agx/fp`、`/home/agx/rslidar_sdk`、`/home/agx/elevation_map_cupy`
+或 Autoware 工作区。
 
-内置组件：
+这个仓库适合直接 clone 到车载 AGX 上构建和启动。源码包名仍为
+`ele_scout_kit`，仓库名为 `eletranskit_scout`。
+
+## 包含内容
 
 - Fixposition ROS 2 驱动及其全部必需库/消息包
 - RoboSense `rslidar_sdk`、`rs_driver` 和 `rslidar_msg`
@@ -23,7 +27,7 @@ CuPy 等系统运行环境仍需安装；这些属于操作系统/硬件依赖�
 ## 目录结构
 
 ```text
-ele_scout_kit/
+eletranskit_scout/
 ├── build_workspace.sh          # 构建整个独立工作区
 ├── start_real_car.sh           # 一键启动实车系统
 └── src/
@@ -41,8 +45,8 @@ workspace 的 `install`。
 ## 首次构建
 
 ```bash
-git clone git@github.com:CQULzz/ele_scouts_kit.git
-cd ~/ele_scouts_kit
+git clone git@github.com:CQULzz/eletranskit_scout.git
+cd ~/eletranskit_scout
 python3 -m pip install --user -r requirements-runtime.txt
 ./build_workspace.sh
 ```
@@ -52,7 +56,7 @@ python3 -m pip install --user -r requirements-runtime.txt
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/ele_scout_kit/install/local_setup.bash
+source ~/eletranskit_scout/install/local_setup.bash
 ros2 pkg prefix fixposition_driver_ros2
 ros2 pkg prefix rslidar_sdk
 ros2 pkg prefix elevation_mapping_cupy
@@ -67,7 +71,7 @@ ros2 pkg prefix ht_traversability_ros2
 发布：
 
 ```bash
-cd ~/ele_scout_kit
+cd ~/eletranskit_scout
 ./start_real_car.sh
 ```
 
