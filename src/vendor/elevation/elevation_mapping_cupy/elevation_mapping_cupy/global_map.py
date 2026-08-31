@@ -48,9 +48,18 @@ class GlobalMapWindow:
     length_y: float
 
     def elevation_grid_map_copy(self) -> np.ndarray:
-        """Convert natural ``row=+Y,col=+X`` into GridMap convention."""
+        """Convert natural ``row=Y, col=X`` storage to GridMap coordinates.
 
-        return np.ascontiguousarray(np.flip(self.elevation_yx.T, axis=(0, 1)))
+        The mapper's rolling-map publisher performs the same transformation:
+        GridMap assigns its first matrix axis to decreasing X and its second
+        axis to decreasing Y.  The transpose swaps the natural Y/X axes, and
+        the two flips align their signs.  Column-major ROS serialization is a
+        separate operation performed by ``encode_layer_to_multiarray``.
+        """
+
+        return np.ascontiguousarray(
+            np.flip(self.elevation_yx.T, axis=(0, 1))
+        )
 
 
 @dataclass

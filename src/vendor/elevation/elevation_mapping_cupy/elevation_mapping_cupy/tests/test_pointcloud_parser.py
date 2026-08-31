@@ -7,6 +7,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 from elevation_mapping_cupy.elevation_mapping_node import (
     _pointcloud2_xyz_f32,
     _remove_points_inside_xy_box,
+    _remove_points_inside_xyz_box,
 )
 
 
@@ -89,6 +90,24 @@ def test_self_filter_can_remove_every_point_without_changing_column_count():
 
     assert filtered.shape == (0, 4)
     assert filtered.dtype == points.dtype
+
+
+def test_self_filter_xyz_box_preserves_points_above_and_below_vehicle():
+    points = np.asarray(
+        [
+            [-0.5, 0.0, -0.91, 1.0],
+            [-0.5, 0.0, -0.89, 2.0],
+            [0.2, 0.7, 0.2, 3.0],
+            [-0.5, 0.0, 0.21, 4.0],
+        ],
+        dtype=np.float32,
+    )
+
+    filtered = _remove_points_inside_xyz_box(
+        points, -1.0, 0.2, -0.7, 0.7, -0.9, 0.2
+    )
+
+    np.testing.assert_array_equal(filtered, points[[0, 3]])
 
 
 @pytest.mark.parametrize(

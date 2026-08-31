@@ -160,6 +160,42 @@ def _remove_points_inside_xy_box(
     return points[~inside]
 
 
+def _remove_points_inside_xyz_box(
+    points: np.ndarray,
+    min_x: float,
+    max_x: float,
+    min_y: float,
+    max_y: float,
+    min_z: float,
+    max_z: float,
+) -> np.ndarray:
+    """Remove complete point rows inside an inclusive sensor-frame 3-D box."""
+    _validate_xy_box_bounds(min_x, max_x, min_y, max_y)
+    if not np.isfinite([min_z, max_z]).all():
+        raise ValueError("Self-filter Z bounds must both be finite.")
+    if min_z > max_z:
+        raise ValueError(
+            f"self_filter_min_z ({min_z}) must be <= self_filter_max_z ({max_z})."
+        )
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError(
+            f"Point cloud must have shape (N, >=3), got {points.shape}."
+        )
+    if points.shape[0] == 0:
+        return points
+
+    inside = (
+        (points[:, 0] >= min_x)
+        & (points[:, 0] <= max_x)
+        & (points[:, 1] >= min_y)
+        & (points[:, 1] <= max_y)
+        & (points[:, 2] >= min_z)
+        & (points[:, 2] <= max_z)
+    )
+    return points[~inside]
+
+
 class ElevationMappingNode(Node):
     def __init__(self):
         super().__init__(
@@ -209,6 +245,7 @@ class ElevationMappingNode(Node):
         self._global_map_stamp = None
         self._global_map_pending_stamp = None
         self._global_map_last_window_signature = None
+        self._global_map_last_local_signature = None
         self._global_tiles_last_subscription_count = 0
         self._global_map_failed = False
         if self.enable_global_map:
@@ -242,7 +279,8 @@ class ElevationMappingNode(Node):
             self.get_logger().info(
                 "Point cloud self-filter enabled in the incoming sensor frame: "
                 f"remove x=[{self.self_filter_min_x}, {self.self_filter_max_x}], "
-                f"y=[{self.self_filter_min_y}, {self.self_filter_max_y}] at all heights."
+                f"y=[{self.self_filter_min_y}, {self.self_filter_max_y}], "
+                f"z=[{self.self_filter_min_z}, {self.self_filter_max_z}]."
             )
 
         self._map_q = None
@@ -285,6 +323,11 @@ class ElevationMappingNode(Node):
             'global_map_view_center_y': 0.0,
             'global_map_view_follow_robot': False,
             'global_map_publish_fps': 1.0,
+            'enable_global_map_local_view': False,
+            'global_map_local_topic': '/elevation_mapping_node/elevation_map_global_local',
+            'global_map_local_length_x': 10.0,
+            'global_map_local_length_y': 10.0,
+            'global_map_local_publish_fps': 5.0,
             'global_map_flush_fps': 1.0,
             'global_map_tiles_publish_fps': 2.0,
             'global_map_tiles_per_message': 8,
@@ -306,16 +349,28 @@ class ElevationMappingNode(Node):
         self.global_map_view_center_y = float(self.get_parameter('global_map_view_center_y').value)
         self.global_map_view_follow_robot = bool(self.get_parameter('global_map_view_follow_robot').value)
         self.global_map_publish_fps = float(self.get_parameter('global_map_publish_fps').value)
+        self.enable_global_map_local_view = bool(self.get_parameter('enable_global_map_local_view').value)
+        self.global_map_local_topic = str(self.get_parameter('global_map_local_topic').value)
+        self.global_map_local_length_x = float(self.get_parameter('global_map_local_length_x').value)
+        self.global_map_local_length_y = float(self.get_parameter('global_map_local_length_y').value)
+        self.global_map_local_publish_fps = float(self.get_parameter('global_map_local_publish_fps').value)
         self.global_map_flush_fps = float(self.get_parameter('global_map_flush_fps').value)
         self.global_map_tiles_publish_fps = float(self.get_parameter('global_map_tiles_publish_fps').value)
         self.global_map_tiles_per_message = int(self.get_parameter('global_map_tiles_per_message').value)
         self.global_map_visualization_stride = int(self.get_parameter('global_map_visualization_stride').value)
         if not self.global_map_topic or not self.global_map_tiles_topic:
             raise ValueError('Global-map topic names must be non-empty strings.')
+        if self.enable_global_map_local_view and not self.enable_global_map:
+            raise ValueError('enable_global_map_local_view requires enable_global_map.')
+        if self.enable_global_map_local_view and not self.global_map_local_topic:
+            raise ValueError('global_map_local_topic must be non-empty when enabled.')
         finite_positive = {
             'global_map_view_length_x': self.global_map_view_length_x,
             'global_map_view_length_y': self.global_map_view_length_y,
             'global_map_publish_fps': self.global_map_publish_fps,
+            'global_map_local_length_x': self.global_map_local_length_x,
+            'global_map_local_length_y': self.global_map_local_length_y,
+            'global_map_local_publish_fps': self.global_map_local_publish_fps,
             'global_map_flush_fps': self.global_map_flush_fps,
             'global_map_tiles_publish_fps': self.global_map_tiles_publish_fps,
         }
@@ -336,6 +391,8 @@ class ElevationMappingNode(Node):
             'self_filter_max_x': 0.0,
             'self_filter_min_y': -0.5,
             'self_filter_max_y': 0.5,
+            'self_filter_min_z': -1000000.0,
+            'self_filter_max_z': 1000000.0,
         }
         for name, default in self_filter_defaults.items():
             if not self.has_parameter(name):
@@ -345,12 +402,18 @@ class ElevationMappingNode(Node):
         self.self_filter_max_x = float(self.get_parameter('self_filter_max_x').value)
         self.self_filter_min_y = float(self.get_parameter('self_filter_min_y').value)
         self.self_filter_max_y = float(self.get_parameter('self_filter_max_y').value)
+        self.self_filter_min_z = float(self.get_parameter('self_filter_min_z').value)
+        self.self_filter_max_z = float(self.get_parameter('self_filter_max_z').value)
         _validate_xy_box_bounds(
             self.self_filter_min_x,
             self.self_filter_max_x,
             self.self_filter_min_y,
             self.self_filter_max_y,
         )
+        if not np.isfinite([self.self_filter_min_z, self.self_filter_max_z]).all():
+            raise ValueError('Self-filter Z bounds must both be finite.')
+        if self.self_filter_min_z > self.self_filter_max_z:
+            raise ValueError('self_filter_min_z must be <= self_filter_max_z.')
         if not self.has_parameter('cupy_memory_pool_trim_interval_s'):
             self.declare_parameter('cupy_memory_pool_trim_interval_s', 0.0)
         self.cupy_memory_pool_trim_interval_s = float(
@@ -585,6 +648,7 @@ class ElevationMappingNode(Node):
         self._publishers_dict = {}
         self._publishers_timers = []
         self._global_map_publisher = None
+        self._global_map_local_publisher = None
         self._global_tiles_publisher = None
         # A lightweight completion acknowledgement lets deterministic bag
         # replay release the next cloud only after this callback has finished.
@@ -624,6 +688,12 @@ class ElevationMappingNode(Node):
                 self.global_map_topic,
                 global_qos,
             )
+            if self.enable_global_map_local_view:
+                self._global_map_local_publisher = self.create_publisher(
+                    GridMap,
+                    self.global_map_local_topic,
+                    global_qos,
+                )
             tile_qos = QoSProfile(
                 history=HistoryPolicy.KEEP_LAST,
                 depth=32,
@@ -656,6 +726,7 @@ class ElevationMappingNode(Node):
                 self.trim_cupy_memory_pool
             )
         self.timer_global_map_publish = None
+        self.timer_global_map_local_publish = None
         self.timer_global_map_flush = None
         self.timer_global_tiles_publish = None
         if self.enable_global_map:
@@ -663,6 +734,11 @@ class ElevationMappingNode(Node):
                 1.0 / self.global_map_publish_fps,
                 self.publish_global_map,
             )
+            if self.enable_global_map_local_view:
+                self.timer_global_map_local_publish = self.create_timer(
+                    1.0 / self.global_map_local_publish_fps,
+                    self.publish_global_local_map,
+                )
             self.timer_global_map_flush = self.create_timer(
                 1.0 / self.global_map_flush_fps,
                 self.flush_global_map,
@@ -838,6 +914,55 @@ class ElevationMappingNode(Node):
             if signature == self._global_map_last_window_signature:
                 return
 
+        gm = self._global_window_message(window)
+        self._global_map_publisher.publish(gm)
+        self._global_map_last_window_signature = signature
+
+    def publish_global_local_map(self, force: bool = False) -> None:
+        """Publish a robot-following sensor-range crop from persistent tiles."""
+
+        if (
+            not self.enable_global_map
+            or not self.enable_global_map_local_view
+            or self._global_map_local_publisher is None
+            or self._global_map_failed
+        ):
+            return
+
+        self.accumulate_global_map()
+        if self._global_map_failed:
+            return
+        if not force and not self._global_map.has_observations:
+            return
+        if not force and self._global_map_local_publisher.get_subscription_count() == 0:
+            return
+        view_center = self._get_map_center()[:2]
+        try:
+            window = self._global_map.extract_window(
+                view_center,
+                self.global_map_local_length_x,
+                self.global_map_local_length_y,
+            )
+        except Exception as exc:
+            self._report_global_map_failure("local window extraction", exc)
+            return
+        signature = (
+            self._global_map.revision,
+            window.center_x,
+            window.center_y,
+            window.length_x,
+            window.length_y,
+        )
+        if not force and signature == self._global_map_last_local_signature:
+            return
+        self._global_map_local_publisher.publish(
+            self._global_window_message(window)
+        )
+        self._global_map_last_local_signature = signature
+
+    def _global_window_message(self, window) -> GridMap:
+        """Encode one extracted persistent-global window as a GridMap."""
+
         gm = GridMap()
         gm.header.frame_id = self.map_frame
         gm.header.stamp = (
@@ -865,8 +990,7 @@ class ElevationMappingNode(Node):
         ]
         gm.outer_start_index = 0
         gm.inner_start_index = 0
-        self._global_map_publisher.publish(gm)
-        self._global_map_last_window_signature = signature
+        return gm
 
     def flush_global_map(self) -> None:
         """Queue dirty CPU tiles for the background SQLite writer."""
@@ -1099,9 +1223,11 @@ class ElevationMappingNode(Node):
             self._global_map_pending_stamp = None
             self._global_map_stamp = self.get_clock().now().to_msg()
             self._global_map_last_window_signature = None
+            self._global_map_last_local_signature = None
             # Publish an empty map even without a current subscriber so the
             # transient-local cache cannot retain the pre-clear map.
             self.publish_global_map(force=True)
+            self.publish_global_local_map(force=True)
             delete_all = Marker()
             delete_all.header.frame_id = self.map_frame
             delete_all.header.stamp = self._global_map_stamp
@@ -1468,12 +1594,14 @@ class ElevationMappingNode(Node):
             return
 
         if self.self_filter_enabled:
-            pts = _remove_points_inside_xy_box(
+            pts = _remove_points_inside_xyz_box(
                 pts,
                 self.self_filter_min_x,
                 self.self_filter_max_x,
                 self.self_filter_min_y,
                 self.self_filter_max_y,
+                self.self_filter_min_z,
+                self.self_filter_max_z,
             )
             if pts.size == 0:
                 return
