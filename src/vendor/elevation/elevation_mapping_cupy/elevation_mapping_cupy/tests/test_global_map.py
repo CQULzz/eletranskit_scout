@@ -59,9 +59,34 @@ def test_window_xy_axes_and_gridmap_conversion_use_independent_oracle():
     window = global_map.extract_window((0.0, 0.0), 2.0, 2.0)
 
     assert np.array_equal(window.elevation_yx, natural)
-    # GridMap row/column zero is the +X/+Y corner.
-    expected_grid_map = np.array([[22.0, 12.0], [21.0, 11.0]], dtype=np.float32)
+    # Natural storage is row=+Y,col=+X. GridMap's matrix axes are row=-X,
+    # col=-Y, so this conversion must match the rolling-map publisher.
+    expected_grid_map = np.array(
+        [[22.0, 12.0], [21.0, 11.0]], dtype=np.float32
+    )
     assert np.array_equal(window.elevation_grid_map_copy(), expected_grid_map)
+
+
+def test_local_window_is_the_same_xy_crop_as_the_global_window():
+    global_map = GlobalMapAccumulator(
+        resolution=1.0,
+        tile_size_cells=4,
+        max_tiles_in_memory=16,
+    )
+    natural = np.arange(6 * 8, dtype=np.float32).reshape(6, 8)
+    global_map.fuse_snapshot((0.0, 0.0), natural)
+
+    full = global_map.extract_window((0.0, 0.0), 8.0, 6.0)
+    local = global_map.extract_window((1.0, -1.0), 4.0, 2.0)
+
+    expected_full = np.flip(natural.T, axis=(0, 1))
+    natural_local = natural[1:3, 3:7]
+    expected_local = np.flip(natural_local.T, axis=(0, 1))
+
+    assert np.array_equal(full.elevation_grid_map_copy(), expected_full)
+    assert np.array_equal(local.elevation_grid_map_copy(), expected_local)
+    # A 4 m X by 2 m Y window must become a 4-row by 2-column GridMap layer.
+    assert local.elevation_grid_map_copy().shape == (4, 2)
 
 
 @pytest.mark.parametrize("shape", [(3, 3), (2, 3), (3, 2), (5, 4)])

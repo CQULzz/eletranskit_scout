@@ -5,13 +5,15 @@
     base_frame: FP_POI
     initialize_frame_id: [FP_POI]
 
-    # Remove the rectangular vehicle-body return in the LiDAR frame.
-    # Bounds are inclusive and apply to all Z values.
+    # Remove the measured vehicle-body return in the LiDAR frame while keeping
+    # points above and below the vehicle volume.
     self_filter_enabled: true
     self_filter_min_x: -1.0
-    self_filter_max_x: 0.0
-    self_filter_min_y: -0.5
-    self_filter_max_y: 0.5
+    self_filter_max_x: 0.2
+    self_filter_min_y: -0.7
+    self_filter_max_y: 0.7
+    self_filter_min_z: -0.9
+    self_filter_max_z: 0.2
 
     # Every fused cloud updates a logically unbounded sparse tile map. The
     # finite GridMap topic is only a detailed view; tiles remain on disk.
@@ -21,6 +23,14 @@
     global_map_view_length_x: 30.0
     global_map_view_length_y: 30.0
     global_map_view_follow_robot: false
+
+    # A second 10 m robot-following view is cropped from the accumulated
+    # persistent global map and fed to the eight-direction inference node.
+    enable_global_map_local_view: true
+    global_map_local_topic: /elevation_mapping_node/elevation_map_global_local
+    global_map_local_length_x: 10.0
+    global_map_local_length_y: 10.0
+    global_map_local_publish_fps: 20.0
 
     subscribers:
       lidar:

@@ -33,6 +33,7 @@ required_installs=(
   "${KIT_ROOT}/install/elevation_map_msgs/share/elevation_map_msgs/package.xml"
   "${KIT_ROOT}/install/ros2_numpy/share/ros2_numpy/package.xml"
   "${KIT_ROOT}/install/elevation_mapping_cupy/share/elevation_mapping_cupy/package.xml"
+  "${KIT_ROOT}/install/ht_traversability_ros2/share/ht_traversability_ros2/package.xml"
 )
 for required_install in "${required_installs[@]}"; do
   if [[ ! -r "${required_install}" ]]; then
@@ -44,7 +45,10 @@ done
 
 source_required "${KIT_ROOT}/install/local_setup.bash" "standalone ele_scout_kit workspace"
 
-for package_name in fixposition_driver_ros2 rslidar_msg rslidar_sdk elevation_mapping_cupy; do
+# Jetson PyTorch wheels may bundle CUPTI below the active Python installation.
+source_required "${KIT_ROOT}/setup_runtime_env.sh" "KIT runtime environment"
+
+for package_name in fixposition_driver_ros2 rslidar_msg rslidar_sdk elevation_mapping_cupy ht_traversability_ros2; do
   package_prefix="$(ros2 pkg prefix "${package_name}")"
   if [[ "${package_prefix}" != "${KIT_ROOT}/install/"* ]]; then
     echo "Error: ${package_name} resolved outside this repository: ${package_prefix}" >&2
@@ -55,7 +59,7 @@ done
 if ! python3 - <<'PY'
 import importlib
 
-required = ("cupy", "cv2", "numpy", "scipy", "shapely", "ruamel.yaml", "simple_parsing")
+required = ("cupy", "cv2", "numpy", "scipy", "shapely", "ruamel.yaml", "simple_parsing", "torch")
 missing = []
 for module in required:
     try:

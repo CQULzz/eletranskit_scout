@@ -6,9 +6,11 @@
       initialize_frame_id: [FP_POI] #vrtk_link
       self_filter_enabled: true
       self_filter_min_x: -1.0
-      self_filter_max_x: 0.0
-      self_filter_min_y: -0.5
-      self_filter_max_y: 0.5
+      self_filter_max_x: 0.2
+      self_filter_min_y: -0.7
+      self_filter_max_y: 0.7
+      self_filter_min_z: -0.9
+      self_filter_max_z: 0.2
 
       # Every fused cloud updates an unbounded sparse tile map. The 30 m
       # GridMap topic is only a detailed view; all tiles are retained on disk.

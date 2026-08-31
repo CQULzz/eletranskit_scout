@@ -1,0 +1,99 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="scout_sensor_rack">
+  <!--
+    Chassis geometry: sample_vehicle_launch_for_scout/scout_vehicle_description.
+    Sensor geometry/calibration: sample_sensor_kit_launch_for_scout.
+    REP-103: x forward, y left, z up. Units are metres/radians.
+  -->
+
+  <material name="chassis_gray"><color rgba="0.16 0.18 0.20 1"/></material>
+  <material name="rack_gray"><color rgba="0.45 0.48 0.52 1"/></material>
+  <material name="lidar_blue"><color rgba="0.05 0.35 0.85 1"/></material>
+  <material name="fp_orange"><color rgba="0.95 0.35 0.05 1"/></material>
+  <material name="antenna_white"><color rgba="0.90 0.90 0.90 1"/></material>
+  <material name="imu_red"><color rgba="0.85 0.05 0.05 1"/></material>
+  <material name="camera_blue"><color rgba="0.10 0.55 0.95 1"/></material>
+
+  <link name="base_footprint"/>
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="40"/>
+      <inertia ixx="0.763944" ixy="0" ixz="0" iyy="2.258072" iyz="0" izz="2.714045"/>
+    </inertial>
+    <visual>
+      <geometry><mesh filename="package://ele_scout_kit/meshes/base_link.dae"/></geometry>
+      <material name="chassis_gray"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0"/>
+      <geometry><box size="0.925 0.380 0.210"/></geometry>
+    </collision>
+  </link>
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0.23479" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:macro name="scout_wheel" params="name mesh x y roll">
+    <link name="${name}">
+      <visual>
+        <geometry><mesh filename="package://ele_scout_kit/meshes/${mesh}"/></geometry>
+        <material name="chassis_gray"/>
+      </visual>
+      <collision>
+        <origin rpy="1.57079632679 0 0"/>
+        <geometry><cylinder radius="0.16459" length="0.11653"/></geometry>
+      </collision>
+    </link>
+    <joint name="${name}_joint" type="fixed">
+      <parent link="base_link"/><child link="${name}"/>
+      <origin xyz="${x} ${y} -0.0702" rpy="${roll} 0 0"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:scout_wheel name="front_right_wheel_link" mesh="wheel_type1.dae" x="0.249" y="-0.29153" roll="3.14159265359"/>
+  <xacro:scout_wheel name="front_left_wheel_link"  mesh="wheel_type2.dae" x="0.249" y="0.29153"  roll="0"/>
+  <xacro:scout_wheel name="rear_left_wheel_link"   mesh="wheel_type1.dae" x="-0.249" y="0.29153" roll="0"/>
+  <xacro:scout_wheel name="rear_right_wheel_link"  mesh="wheel_type2.dae" x="-0.249" y="-0.29153" roll="3.14159265359"/>
+
+  <!--
+    The upstream calibration used z=0.1823, which leaves a 66.1 mm visual gap
+    with this Scout mesh.  The rack mesh has min-z=0 and the chassis mesh top
+    is z=0.1162, so this assembly uses a contact-fit z=0.1162.
+  -->
+  <link name="sensor_kit_base_link"/>
+  <joint name="sensor_kit_mount_joint" type="fixed">
+    <parent link="base_link"/><child link="sensor_kit_base_link"/>
+    <origin xyz="0.1725 0 0.1162" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:macro name="sensor_mesh" params="name mesh xyz material">
+    <link name="${name}">
+      <visual>
+        <geometry><mesh filename="package://ele_scout_kit/meshes/${mesh}"/></geometry>
+        <material name="${material}"/>
+      </visual>
+    </link>
+    <joint name="${name}_joint" type="fixed">
+      <parent link="sensor_kit_base_link"/><child link="${name}"/>
+      <origin xyz="${xyz}" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:sensor_mesh name="sensor_frame_link" mesh="frame.STL" xyz="0 0 0" material="rack_gray"/>
+  <xacro:sensor_mesh name="rs_helios_link" mesh="rs_helios.STL" xyz="0 0 0.434" material="lidar_blue"/>
+  <xacro:sensor_mesh name="fixposition_link" mesh="fixposition_link.STL" xyz="0.0280158179045505 0 0.308" material="fp_orange"/>
+  <xacro:sensor_mesh name="gnss_right_link" mesh="gnss_antenna.STL" xyz="0 -0.31 0.313" material="antenna_white"/>
+  <xacro:sensor_mesh name="gnss_left_link" mesh="gnss_antenna.STL" xyz="0 0.31 0.313" material="antenna_white"/>
+  <xacro:sensor_mesh name="imu_tm431_link" mesh="imu_tm431.STL" xyz="0 0 0.4195" material="imu_red"/>
+  <xacro:sensor_mesh name="rs_m1_link" mesh="rs_m1.STL" xyz="0.0299201190023903 0 0.187" material="chassis_gray"/>
+  <xacro:sensor_mesh name="zed2i_link" mesh="zed2i.stl" xyz="0.0999943368718406 0 0.248125240515285" material="camera_blue"/>
+
+  <!-- TF-friendly optical/data aliases; they do not change the physical placement. -->
+  <link name="rslidar"/>
+  <joint name="rslidar_alias_joint" type="fixed">
+    <parent link="rs_helios_link"/><child link="rslidar"/><origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+</robot>

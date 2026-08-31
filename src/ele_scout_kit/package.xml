@@ -3,7 +3,7 @@
 <package format="3">
   <name>ele_scout_kit</name>
   <version>1.0.0</version>
-  <description>Standalone real-car bringup for the bundled Fixposition, RoboSense LiDAR, TF, RViz, and elevation mapping packages.</description>
+  <description>Standalone real-car bringup for bundled localization, LiDAR, elevation mapping, HT traversability, TF, and RViz.</description>
 
   <maintainer email="20210959@cqu.edu.cn">CQULzz</maintainer>
   <license>MIT</license>
@@ -16,9 +16,17 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>rslidar_sdk</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>grid_map_rviz_plugin</exec_depend>
+  <exec_depend>grid_map_msgs</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>ht_traversability_ros2</exec_depend>
+  <exec_depend>xacro</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

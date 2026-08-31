@@ -10,8 +10,12 @@
 - RoboSense `rslidar_sdk`、`rs_driver` 和 `rslidar_msg`
 - 当前实车修改版 `elevation_mapping_cupy`、`elevation_map_msgs`、
   `ros2_numpy` 和 `semantic_sensor`
+- HT 八方向可通过性 ROS 2 节点和已验证的 student 模型权重
 - 实车参数、三条静态 TF、正确的 ROS 2 RViz 配置
 - 一键构建和一键启动脚本
+
+HT 是仓库内的普通源码包 `src/ht_traversability_ros2`，模型权重也保存在该目录。
+它不是软链接、Git submodule，也不依赖 `/home/agx/ht_trans` 或其它本地工作区。
 
 第三方源码版本和许可证说明见 [THIRD_PARTY.md](THIRD_PARTY.md)。ROS、CUDA、
 CuPy 等系统运行环境仍需安装；这些属于操作系统/硬件依赖，不是其它工作区程序。
@@ -23,6 +27,7 @@ ele_scout_kit/
 ├── build_workspace.sh          # 构建整个独立工作区
 ├── start_real_car.sh           # 一键启动实车系统
 └── src/
+    ├── ht_traversability_ros2/ # HT 节点、模型和测试
     ├── ele_scout_kit/          # launch、实车配置和 RViz
     └── vendor/
         ├── fixposition/        # FP 驱动、SDK、消息
@@ -36,14 +41,14 @@ workspace 的 `install`。
 ## 首次构建
 
 ```bash
-git clone git@github.com:CQULzz/ele_scout_kit.git
-cd ~/ele_scout_kit
+git clone git@github.com:CQULzz/ele_scouts_kit.git
+cd ~/ele_scouts_kit
 python3 -m pip install --user -r requirements-runtime.txt
 ./build_workspace.sh
 ```
 
 脚本只会 source `/opt/ros/humble/setup.bash`，随后从本仓库 `src/` 构建全部
-13 个 ROS 包。构建成功后可以确认各程序确实来自本仓库：
+14 个 ROS 包。构建成功后可以确认各程序确实来自本仓库：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -51,9 +56,10 @@ source ~/ele_scout_kit/install/local_setup.bash
 ros2 pkg prefix fixposition_driver_ros2
 ros2 pkg prefix rslidar_sdk
 ros2 pkg prefix elevation_mapping_cupy
+ros2 pkg prefix ht_traversability_ros2
 ```
 
-三个输出都应位于 `~/ele_scout_kit/install/`。
+四个输出都应位于当前 clone 目录的 `install/`。
 
 ## 一键启动并实时看图
 
@@ -69,11 +75,17 @@ cd ~/ele_scout_kit
 
 1. Fixposition 驱动；
 2. RSHELIOS 雷达驱动；
-3. `FP_POI -> rslidar`、`FP_ENU0 -> map`、`map -> odom`；
+3. 组合 URDF 固定 TF 树、`FP_POI -> base_footprint`、`FP_ENU0 -> map`、`map -> odom`；
 4. 高程图节点（延迟 5 秒）；
-5. RViz。
+5. 仓库内 HT 八方向可通过性节点（延迟 7 秒）；
+6. RViz。
 
-RViz 已设为 `Fixed Frame = odom`，默认显示：
+RViz 已设为 `Fixed Frame = odom`。实时 HT 使用全局图中跟随车辆的 10 m 局部
+裁剪 `/elevation_mapping_node/elevation_map_global_local`，默认发布保守综合结果
+`/ht_traversability/global_local`：八个方向全部达到阈值才显示绿色，任一方向不满足
+就显示红色。
+
+RViz 默认显示：
 
 - `/rslidar_points`
 - `/elevation_mapping_node/elevation_map_global_tiles`：持续累积的稀疏全局高程瓦片
@@ -111,7 +123,10 @@ RViz 已设为 `Fixed Frame = odom`，默认显示：
 src/ele_scout_kit/config/fixposition.yaml
 src/ele_scout_kit/config/rslidar.yaml
 src/ele_scout_kit/config/elevation_mapping_real_car.yaml
+src/ele_scout_kit/config/ht_traversability_real_car.yaml
 src/ele_scout_kit/config/real_car.rviz
+src/ele_scout_kit/urdf/scout_sensor_rack.urdf.xacro
+src/ht_traversability_ros2/models/student_best_epoch_weights.pth
 ```
 
 Fixposition 默认连接 `tcpcli://192.168.1.103:21000`。RSLidar 默认型号为
@@ -162,21 +177,32 @@ du -h ~/.ros/elevation_mapping_cupy/global_tiles.sqlite3*
 ros2 service call /elevation_mapping_cupy/clear_global_map std_srvs/srv/Trigger '{}'
 ```
 
-当前默认静态外参：
+当前默认静态外参来自组合后的 Scout + 传感器支架 URDF。这里按
+`fixposition_link` 与驱动输出的 `FP_POI` 同位处理：
 
 | 父坐标系 | 子坐标系 | 默认值 |
 |---|---|---|
-| `FP_POI` | `rslidar` | 全 0，仅供当前连通调试 |
+| `FP_POI` | `base_footprint` | `xyz=(-0.2005158179, 0, -0.65899)`, `rpy=(0,0,0)` |
+| `base_footprint` | `base_link` | `xyz=(0, 0, 0.23479)`, `rpy=(0,0,0)` |
+| `base_link` | `sensor_kit_base_link` | `xyz=(0.1725, 0, 0.1162)`, `rpy=(0,0,0)`（网格接触高度） |
+| `sensor_kit_base_link` | `rs_helios_link` | `xyz=(0, 0, 0.434)`, `rpy=(0,0,0)` |
+| `rs_helios_link` | `rslidar` | 全 0（驱动 frame 别名） |
 | `FP_ENU0` | `map` | 全 0 |
 | `map` | `odom` | 全 0 |
 
-`FP_POI -> rslidar` 的零外参必须在获得实车标定值后替换，否则会产生高程
-错位和重影。可临时通过 launch 参数覆盖：
+因此等效的 `FP_POI -> rslidar` 是
+`xyz=(-0.0280158179, 0, 0.126)`、`rpy=(0,0,0)`。如果实车的 Fixposition
+内部 POI 不在设备网格原点，必须用实测 POI 外参修正下面的桥接值，否则仍会产生
+高程错位和重影。可通过 launch 参数覆盖：
 
 ```bash
 ./start_real_car.sh \
-  poi_to_lidar_x:=0.0 poi_to_lidar_y:=0.0 poi_to_lidar_z:=0.0 \
-  poi_to_lidar_roll:=0.0 poi_to_lidar_pitch:=0.0 poi_to_lidar_yaw:=0.0
+  poi_to_base_footprint_x:=-0.2005158179 \
+  poi_to_base_footprint_y:=0.0 \
+  poi_to_base_footprint_z:=-0.65899 \
+  poi_to_base_footprint_roll:=0.0 \
+  poi_to_base_footprint_pitch:=0.0 \
+  poi_to_base_footprint_yaw:=0.0
 ```
 
 ## 运行检查
@@ -186,6 +212,8 @@ ros2 topic hz /rslidar_points
 ros2 topic hz /elevation_mapping_node/elevation_map_raw
 ros2 topic hz /elevation_mapping_node/elevation_map_global
 ros2 topic hz /elevation_mapping_node/elevation_map_global_tiles
+ros2 topic hz /elevation_mapping_node/elevation_map_global_local
+ros2 topic hz /ht_traversability/global_local
 ros2 run tf2_ros tf2_echo odom FP_POI
 ros2 run tf2_ros tf2_echo odom rslidar
 ```
@@ -196,10 +224,10 @@ ros2 run tf2_ros tf2_echo odom rslidar
 
 ## 系统依赖
 
-已在 NVIDIA AGX、Ubuntu 22.04、ROS 2 Humble、CUDA 12 环境验证。源码已经
-内置，但新机器仍需具备 ROS/CUDA 和常规系统库，例如 Boost、Eigen、yaml-cpp、
-libpcap、OpenCV、NumPy、SciPy、Shapely、CuPy。可先用 rosdep 检查常规 ROS
-依赖：
+已在 NVIDIA AGX、Ubuntu 22.04、ROS 2 Humble、CUDA 12 环境验证。所有应用源码
+和 HT 模型已经内置，但新机器仍需具备 ROS/CUDA 和常规系统库，例如 Boost、
+Eigen、yaml-cpp、libpcap、OpenCV、NumPy、SciPy、Shapely、CuPy，以及与该机器
+JetPack/CUDA 匹配的 NVIDIA PyTorch。可先用 rosdep 检查常规 ROS 依赖：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -213,5 +241,12 @@ python3 -m pip install --user -r requirements-runtime.txt
 `cupy-cuda12x 13.6.0`。可用下面的命令检查关键模块：
 
 ```bash
-python3 -c 'import cupy, cv2, numpy, scipy, shapely, ruamel.yaml, simple_parsing; print("Python dependencies OK")'
+python3 -c 'import cupy, cv2, numpy, scipy, shapely, ruamel.yaml, simple_parsing, torch; print("Python dependencies OK", torch.cuda.is_available())'
+source install/local_setup.bash
+source ./setup_runtime_env.sh
+ros2 run ht_traversability_ros2 ht_preflight --device cuda
 ```
+
+`setup_runtime_env.sh` 和 `start_real_car.sh` 会从当前 Python 环境自动发现 NVIDIA PyTorch 附带的 CUPTI，
+不会假设用户名、Python 小版本或固定的 `/home/agx` 路径。若 CUDA/PyTorch 尚未
+安装，脚本会在启动硬件前明确报告缺少的模块。

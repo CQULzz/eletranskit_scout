@@ -1,0 +1,32 @@
+/ht_traversability_node:
+  ros__parameters:
+    input_topic: /elevation_mapping_node/elevation_map_filter
+    input_layer: inpaint
+    output_topic: /ht_traversability/traversability_8dir
+
+    # Empty means the checkpoint installed in the package share directory.
+    model_path: ""
+    device: cuda
+    allow_cpu_fallback: false
+
+    # The validated Scout student was trained at 4 cm/cell.
+    expected_resolution: 0.04
+    resolution_tolerance: 0.001
+    inference_fps: 5.0
+
+    # Pre-select CUDA/cuDNN kernels before the first real elevation frame.
+    warmup_rows: 250
+    warmup_cols: 250
+    warmup_iterations: 2
+
+    # A 51x51 output window must contain this fraction of finite input cells.
+    min_valid_ratio: 0.70
+
+    # Optional conservative output: all eight directions must meet threshold.
+    # Disabled here for backward-compatible standalone eight-direction output.
+    aggregate_only: false
+    traversability_threshold: 0.5
+
+    # Published ht_dir_i uses raw model channel direction_channel_order[i].
+    # Keep identity until the physical direction calibration is complete.
+    direction_channel_order: [0, 1, 2, 3, 4, 5, 6, 7]

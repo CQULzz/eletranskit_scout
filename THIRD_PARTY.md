@@ -14,6 +14,7 @@ remain in the corresponding source directories.
 | elevation_mapping_cupy and elevation_map_msgs | `8fd49565f622ae1481c0a22d6c8897441f7e2b7e` plus the current real-car fixes | MIT | `src/vendor/elevation` |
 | ros2_numpy | `d5ebf723e1d2457d36fa89bf021b212e340c3c11` | MIT | `src/vendor/elevation/ros2_numpy` |
 | semantic_sensor | bundled with the elevation mapping snapshot | MIT | `src/vendor/elevation/semantic_sensor` |
+| HT eight-direction traversability ROS 2 package and student checkpoint | `CQULzz/ht_trans` commit `7a95976` plus KIT integration changes | Proprietary research code | `src/ht_traversability_ros2` |
 
 The top-level MIT license covers the original `ele_scout_kit` bringup code,
 not third-party components under `src/vendor`.
