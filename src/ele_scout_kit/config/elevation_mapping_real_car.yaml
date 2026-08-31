@@ -5,6 +5,12 @@
     base_frame: FP_POI
     initialize_frame_id: [FP_POI]
 
+    # The live RoboSense publisher offers RELIABLE. Match it and keep only a
+    # very short queue so a transient scheduling delay does not silently lose
+    # a complete 360-degree scan or accumulate stale scans.
+    pointcloud_qos_reliability: reliable
+    pointcloud_qos_depth: 2
+
     # Remove the measured vehicle-body return in the LiDAR frame while keeping
     # points above and below the vehicle volume.
     self_filter_enabled: true

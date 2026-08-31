@@ -21,12 +21,9 @@ lidar:
       start_angle: 0.0
       end_angle: 360.0
 
-      # RSHELIOS emits about 1800 blocks per revolution at 10 rps. Split each
-      # revolution into two fresh half-scan clouds so the mapper has enough
-      # input headroom for a stable 10 Hz output instead of being capped by
-      # the observed 8-9 Hz full-revolution publication rate.
-      split_frame_mode: 3
-      num_blks_split: 900
+      # Publish one complete 360-degree cloud per physical revolution.
+      split_frame_mode: 1
+      split_angle: 0.0
 
       # Only used when msg_source is 3.
       pcap_repeat: true

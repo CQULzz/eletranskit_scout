@@ -18,7 +18,10 @@
     allow_cpu_fallback: false
     expected_resolution: 0.04
     resolution_tolerance: 0.001
-    inference_fps: 20.0
+    # Process every new local-map revision. A wall-clock rate limiter can drop
+    # one of two jittered 10 Hz inputs that happen to arrive <50 ms apart even
+    # though their long-term rate is only 10 Hz.
+    inference_fps: 0.0
     warmup_rows: 250
     warmup_cols: 250
     warmup_iterations: 2

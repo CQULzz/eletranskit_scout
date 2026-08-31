@@ -16,7 +16,6 @@ from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
     QoSProfile,
-    QoSPresetProfiles,
     ReliabilityPolicy,
 )
 from ament_index_python.packages import get_package_share_directory
@@ -332,6 +331,25 @@ class ElevationMappingNode(Node):
         self.update_pose_fps = self.get_parameter('update_pose_fps').get_parameter_value().double_value
         if self.update_pose_fps <= 0.0:
             raise ValueError('update_pose_fps must be positive.')
+        pointcloud_qos_defaults = {
+            'pointcloud_qos_reliability': 'best_effort',
+            'pointcloud_qos_depth': 5,
+        }
+        for name, default in pointcloud_qos_defaults.items():
+            if not self.has_parameter(name):
+                self.declare_parameter(name, default)
+        self.pointcloud_qos_reliability = str(
+            self.get_parameter('pointcloud_qos_reliability').value
+        ).strip().lower()
+        self.pointcloud_qos_depth = int(
+            self.get_parameter('pointcloud_qos_depth').value
+        )
+        if self.pointcloud_qos_reliability not in {'best_effort', 'reliable'}:
+            raise ValueError(
+                "pointcloud_qos_reliability must be 'best_effort' or 'reliable'."
+            )
+        if self.pointcloud_qos_depth <= 0:
+            raise ValueError('pointcloud_qos_depth must be positive.')
         global_map_defaults = {
             'enable_global_map': False,
             'global_map_topic': '/elevation_mapping_node/elevation_map_global',
@@ -647,8 +665,16 @@ class ElevationMappingNode(Node):
             if not topic_name:
                 raise ValueError(f"Subscriber '{key}' is missing required key 'topic_name'.")
 
-            # Use sensor data QoS (BEST_EFFORT) for point clouds
-            qos_profile = QoSPresetProfiles.get_from_short_key("sensor_data")
+            qos_profile = QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=self.pointcloud_qos_depth,
+                reliability=(
+                    ReliabilityPolicy.RELIABLE
+                    if self.pointcloud_qos_reliability == 'reliable'
+                    else ReliabilityPolicy.BEST_EFFORT
+                ),
+                durability=DurabilityPolicy.VOLATILE,
+            )
             self._pointcloud_subs[key] = self.create_subscription(
                 PointCloud2,
                 topic_name,

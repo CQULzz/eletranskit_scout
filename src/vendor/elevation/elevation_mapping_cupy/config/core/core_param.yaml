@@ -74,6 +74,10 @@
     publish_statistics_fps: 1.0                     # Publish statistics topic in this fps.
     recordable_fps: 3.0                           # Recordable fps for pointcloud.
     enable_normal_arrow_publishing: false
+    # Incoming point-cloud QoS. Robot-specific live configurations may select
+    # reliable when the hardware driver also offers reliable delivery.
+    pointcloud_qos_reliability: 'best_effort'
+    pointcloud_qos_depth: 5
 
     masked_replace_service_mask_layer_name: 'mask'
     save_map_default_topic: 'elevation_map'
