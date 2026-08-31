@@ -24,6 +24,15 @@
     global_map_view_length_y: 30.0
     global_map_view_follow_robot: false
 
+    # Keep GPU mapping on the point-cloud callback's critical path, but move
+    # GPU-to-CPU download and sparse tile fusion to a latest-only worker.
+    global_map_async_fusion: true
+    global_map_snapshot_buffer_count: 3
+
+    # HT computes the actual eight-direction traversability. Avoid running the
+    # mapper's separate legacy traversability network on every LiDAR frame.
+    enable_builtin_traversability: false
+
     # A second 10 m robot-following view is cropped from the accumulated
     # persistent global map and fed to the eight-direction inference node.
     enable_global_map_local_view: true
@@ -39,7 +48,7 @@
 
     publishers:
       elevation_map_raw:
-        layers: [elevation, traversability, variance]
+        layers: [elevation, variance]
         basic_layers: [elevation]
         fps: 10.0
 

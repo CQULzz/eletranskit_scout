@@ -21,6 +21,23 @@ def encode_max(maxim, index):
     return mer
 
 
+def test_disable_builtin_traversability_skips_model_weights(monkeypatch):
+    def fail_if_loaded(_self, _path):
+        raise AssertionError("legacy traversability weights must not be loaded")
+
+    monkeypatch.setattr(parameter.Parameter, "load_weights", fail_if_loaded)
+    p = parameter.Parameter(
+        use_chainer=False,
+        enable_builtin_traversability=False,
+        weight_file=str(_CONFIG_DIR / "weights.dat"),
+        plugin_config_file=str(_CONFIG_DIR / "plugin_config.yaml"),
+    )
+    p.update()
+
+    elevation_map = elevation_mapping.ElevationMap(p)
+    assert elevation_map.traversability_filter is None
+
+
 @pytest.fixture()
 def elmap_ex(add_lay, fusion_alg):
     additional_layer = add_lay
@@ -73,6 +90,26 @@ class TestElevationMap:
             pos = np.array([i * 0.01, i * 0.02, i * 0.01])
             R = cp.random.rand(3, 3)
             elmap_ex.move_to(pos, R)
+
+    def test_async_elevation_snapshot_buffer(self, elmap_ex):
+        center = np.array([1.0, -2.0, 0.5], dtype=np.float32)
+        elmap_ex.move_to(center, cp.eye(3, dtype=cp.float32))
+        with elmap_ex.map_lock:
+            elmap_ex.elevation_map[0, 10, 12] = cp.float32(0.25)
+            elmap_ex.elevation_map[2, 10, 12] = cp.float32(1.0)
+
+        slot = elmap_ex.create_elevation_snapshot_buffer()
+        stream = elmap_ex.create_elevation_snapshot_copy_stream()
+        elmap_ex.capture_elevation_snapshot_gpu(slot)
+        copied_center, elevation = elmap_ex.materialize_elevation_snapshot(
+            slot, stream
+        )
+
+        np.testing.assert_allclose(copied_center, center, atol=1.0e-6)
+        assert elevation.dtype == np.float32
+        assert elevation.shape == (elmap_ex.cell_n - 2, elmap_ex.cell_n - 2)
+        assert elevation[9, 11] == pytest.approx(0.75)
+        assert np.isnan(elevation[0, 0])
 
     def test_get_map(self, elmap_ex):
         layers = [

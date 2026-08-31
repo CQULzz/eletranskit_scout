@@ -30,6 +30,8 @@
     global_map_local_length_x: 10.0
     global_map_local_length_y: 10.0
     global_map_local_publish_fps: 5.0
+    global_map_async_fusion: false                 # Opt-in latest-only GPU snapshot worker.
+    global_map_snapshot_buffer_count: 2            # Must be >=2 when async fusion is enabled.
     global_map_flush_fps: 1.0
     global_map_tiles_publish_fps: 2.0
     global_map_tiles_per_message: 8
@@ -99,6 +101,12 @@
     enable_visibility_cleanup: true
     enable_drift_compensation: true
     enable_overlap_clearance: true
+    # The mapper's legacy single-score traversability filter is independent
+    # from downstream HT/ZT inference and may be disabled when unused.
+    enable_builtin_traversability: true
+    # Visibility cleanup consumes the normal map, so keep this enabled unless
+    # visibility cleanup is disabled as well.
+    enable_normal_estimation: true
     enable_pointcloud_publishing: false
     enable_drift_corrected_TF_publishing: false
     #### Traversability filter ########

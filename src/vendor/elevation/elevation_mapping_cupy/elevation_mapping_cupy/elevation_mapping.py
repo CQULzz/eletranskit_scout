@@ -72,6 +72,21 @@ class GridGeometry:
         return rows, cols
 
 
+@dataclass
+class ElevationSnapshotBuffer:
+    """Reusable GPU and pinned-CPU storage for one global-map snapshot."""
+
+    elevation_gpu: Any
+    center_gpu: Any
+    elevation_cpu: np.ndarray
+    center_cpu: np.ndarray
+    ready_event: Any
+    elevation_pinned_memory: Any
+    center_pinned_memory: Any
+    stamp: Any = None
+    generation: int = 0
+
+
 BASE_LAYER_TO_INDEX = {
     "elevation": 0,
     "variance": 1,
@@ -107,7 +122,9 @@ class ElevationMap:
         self.map_length = param.map_length
         self.cell_n = param.cell_n
 
-        self.map_lock = threading.Lock()
+        # Snapshot capture can be called around an atomic move_to operation;
+        # use an RLock so move_to can reuse the existing locked shift helpers.
+        self.map_lock = threading.RLock()
         self.elevation_map = xp.zeros((7, self.cell_n, self.cell_n), dtype=self.data_type)
         self.layer_names = [
             "elevation",
@@ -139,13 +156,19 @@ class ElevationMap:
 
         self.compile_kernels()
 
-        # No shell substitutions in research code: param.weight_file is expected to be a real path.
-        param.load_weights(param.weight_file)
-
-        if param.use_chainer:
-            self.traversability_filter = get_filter_chainer(param.w1, param.w2, param.w3, param.w_out)
-        else:
-            self.traversability_filter = get_filter_torch(param.w1, param.w2, param.w3, param.w_out)
+        self.traversability_filter = None
+        if param.enable_builtin_traversability:
+            # No shell substitutions in research code: param.weight_file is
+            # expected to be a real path.
+            param.load_weights(param.weight_file)
+            if param.use_chainer:
+                self.traversability_filter = get_filter_chainer(
+                    param.w1, param.w2, param.w3, param.w_out
+                )
+            else:
+                self.traversability_filter = get_filter_torch(
+                    param.w1, param.w2, param.w3, param.w_out
+                )
         self.untraversable_polygon = xp.zeros((1, 2))
 
         # Plugins
@@ -196,16 +219,18 @@ class ElevationMap:
             position (numpy.ndarray):
             R (cupy._core.core.ndarray):
         """
-        # Shift map to the center of robot.
-        self.base_rotation = xp.asarray(R, dtype=self.data_type)
-        position = xp.asarray(position)
-        delta = position - self.center
-        delta_pixel = xp.around(delta[:2] / self.resolution)
-        delta_xy = delta_pixel * self.resolution
-        self.center[:2] += delta_xy
-        self.center[2] += delta[2]
-        self.shift_map_xy(-delta_pixel)
-        self.shift_map_z(-delta[2])
+        # Keep center and array shifts atomic with respect to asynchronous
+        # global-map snapshot capture.
+        with self.map_lock:
+            self.base_rotation = xp.asarray(R, dtype=self.data_type)
+            position = xp.asarray(position)
+            delta = position - self.center
+            delta_pixel = xp.around(delta[:2] / self.resolution)
+            delta_xy = delta_pixel * self.resolution
+            self.center[:2] += delta_xy
+            self.center[2] += delta[2]
+            self.shift_map_xy(-delta_pixel)
+            self.shift_map_z(-delta[2])
 
     def pad_value(self, x, shift_value, idx=None, value=0.0):
         """Create a padding of the map along x,y-axis according to amount that has shifted.
@@ -418,22 +443,30 @@ class ElevationMap:
             if self.param.enable_overlap_clearance:
                 self.clear_overlap_map(t)
 
-            self.traversability_input *= 0.0
-            self.dilation_filter_kernel(
-                self.elevation_map[5],
-                self.elevation_map[2] + self.elevation_map[6],
-                self.traversability_input,
-                self.traversability_mask_dummy,
-                size=(self.cell_n * self.cell_n),
-            )
+            if (
+                self.param.enable_builtin_traversability
+                or self.param.enable_normal_estimation
+            ):
+                self.traversability_input *= 0.0
+                self.dilation_filter_kernel(
+                    self.elevation_map[5],
+                    self.elevation_map[2] + self.elevation_map[6],
+                    self.traversability_input,
+                    self.traversability_mask_dummy,
+                    size=(self.cell_n * self.cell_n),
+                )
 
-            traversability = self.traversability_filter(self.traversability_input)
-            self.elevation_map[3][3:-3, 3:-3] = traversability.reshape(
-                (traversability.shape[2], traversability.shape[3])
-            )
+            if self.param.enable_builtin_traversability:
+                traversability = self.traversability_filter(
+                    self.traversability_input
+                )
+                self.elevation_map[3][3:-3, 3:-3] = traversability.reshape(
+                    (traversability.shape[2], traversability.shape[3])
+                )
             self.plugin_manager.reset_layers()
 
-        self.update_normal(self.traversability_input)
+        if self.param.enable_normal_estimation:
+            self.update_normal(self.traversability_input)
 
     def clear_overlap_map(self, t):
         """Clear overlapping areas around the map center.
@@ -753,6 +786,82 @@ class ElevationMap:
             self.copy_to_cpu(elevation, data)
             center = cp.asnumpy(self.center).astype(np.float64, copy=False)
         return center, data
+
+    def create_elevation_snapshot_buffer(self) -> ElevationSnapshotBuffer:
+        """Allocate one reusable device snapshot and pinned host destination."""
+
+        shape = (self.cell_n - 2, self.cell_n - 2)
+        elevation_bytes = int(np.prod(shape)) * np.dtype(np.float32).itemsize
+        center_bytes = 3 * np.dtype(np.float32).itemsize
+        elevation_memory = cp.cuda.alloc_pinned_memory(elevation_bytes)
+        center_memory = cp.cuda.alloc_pinned_memory(center_bytes)
+        elevation_cpu = np.frombuffer(
+            elevation_memory, dtype=np.float32, count=int(np.prod(shape))
+        ).reshape(shape)
+        center_cpu = np.frombuffer(center_memory, dtype=np.float32, count=3)
+        return ElevationSnapshotBuffer(
+            elevation_gpu=cp.empty(shape, dtype=cp.float32),
+            center_gpu=cp.empty(3, dtype=cp.float32),
+            elevation_cpu=elevation_cpu,
+            center_cpu=center_cpu,
+            ready_event=cp.cuda.Event(disable_timing=True),
+            elevation_pinned_memory=elevation_memory,
+            center_pinned_memory=center_memory,
+        )
+
+    @staticmethod
+    def create_elevation_snapshot_copy_stream():
+        """Return a non-blocking stream used only by the background copier."""
+
+        return cp.cuda.Stream(non_blocking=True)
+
+    def capture_elevation_snapshot_gpu(
+        self, buffer: ElevationSnapshotBuffer
+    ) -> None:
+        """Capture a coherent rolling posterior without a GPU-to-CPU wait."""
+
+        expected_shape = (self.cell_n - 2, self.cell_n - 2)
+        if buffer.elevation_gpu.shape != expected_shape:
+            raise ValueError(
+                "GPU snapshot buffer shape does not match the rolling map: "
+                f"{buffer.elevation_gpu.shape} vs {expected_shape}."
+            )
+        with self.map_lock:
+            valid = self.elevation_map[2, 1:-1, 1:-1] > 0.5
+            buffer.elevation_gpu[...] = cp.where(
+                valid,
+                self.elevation_map[0, 1:-1, 1:-1] + self.center[2],
+                cp.nan,
+            )
+            buffer.center_gpu[...] = self.center
+            # All map updates and this device copy use the current stream. The
+            # event lets a separate copy stream wait only for this snapshot,
+            # not for point-cloud kernels submitted afterwards.
+            buffer.ready_event.record(cp.cuda.get_current_stream())
+
+    @staticmethod
+    def materialize_elevation_snapshot(
+        buffer: ElevationSnapshotBuffer,
+        stream,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Asynchronously download one captured snapshot, then wait in worker."""
+
+        with stream:
+            stream.wait_event(buffer.ready_event)
+            cp.asnumpy(
+                buffer.elevation_gpu,
+                stream=stream,
+                out=buffer.elevation_cpu,
+                blocking=False,
+            )
+            cp.asnumpy(
+                buffer.center_gpu,
+                stream=stream,
+                out=buffer.center_cpu,
+                blocking=False,
+            )
+        stream.synchronize()
+        return buffer.center_cpu, buffer.elevation_cpu
 
     def trim_memory_pool(self):
         """Release cached CuPy allocator blocks that are not currently in use."""
