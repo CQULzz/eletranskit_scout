@@ -1,8 +1,10 @@
-# ele_scout_kit
+# eletranskit_scout
 
-面向当前实车的完整 ROS 2 Humble 工作区。仓库本身已经包含运行所需的程序
+面向当前 Scout 实车的完整 ROS 2 Humble 工作区。仓库本身已经包含运行所需的程序
 源码，不再依赖 `/home/agx/fp`、`/home/agx/rslidar_sdk`、
 `/home/agx/elevation_map_cupy` 或 Autoware 工作区。
+
+仓库名为 `eletranskit_scout`，其中的集成 ROS 包仍名为 `ele_scout_kit`。
 
 内置组件：
 
@@ -10,12 +12,12 @@
 - RoboSense `rslidar_sdk`、`rs_driver` 和 `rslidar_msg`
 - 当前实车修改版 `elevation_mapping_cupy`、`elevation_map_msgs`、
   `ros2_numpy` 和 `semantic_sensor`
-- HT 八方向可通过性 ROS 2 节点和已验证的 student 模型权重
+- HT、ZT 八方向可通过性 ROS 2 节点和已验证的 student 模型权重
 - 实车参数、三条静态 TF、正确的 ROS 2 RViz 配置
 - 一键构建和一键启动脚本
 
-HT 是仓库内的普通源码包 `src/ht_traversability_ros2`，模型权重也保存在该目录。
-它不是软链接、Git submodule，也不依赖 `/home/agx/ht_trans` 或其它本地工作区。
+HT、ZT 是仓库内的普通源码包，模型权重也保存在各自目录。它们不是软链接、
+Git submodule，也不依赖 `/home/agx/ht_trans` 或其它本地工作区。
 
 第三方源码版本和许可证说明见 [THIRD_PARTY.md](THIRD_PARTY.md)。ROS、CUDA、
 CuPy 等系统运行环境仍需安装；这些属于操作系统/硬件依赖，不是其它工作区程序。
@@ -23,11 +25,12 @@ CuPy 等系统运行环境仍需安装；这些属于操作系统/硬件依赖�
 ## 目录结构
 
 ```text
-ele_scout_kit/
+eletranskit_scout/
 ├── build_workspace.sh          # 构建整个独立工作区
 ├── start_real_car.sh           # 一键启动实车系统
 └── src/
     ├── ht_traversability_ros2/ # HT 节点、模型和测试
+    ├── zt_traversability_ros2/ # ZT 节点、模型和测试
     ├── ele_scout_kit/          # launch、实车配置和 RViz
     └── vendor/
         ├── fixposition/        # FP 驱动、SDK、消息
@@ -41,22 +44,23 @@ workspace 的 `install`。
 ## 首次构建
 
 ```bash
-git clone git@github.com:CQULzz/ele_scouts_kit.git
-cd ~/ele_scouts_kit
+git clone git@github.com:CQULzz/eletranskit_scout.git
+cd ~/eletranskit_scout
 python3 -m pip install --user -r requirements-runtime.txt
 ./build_workspace.sh
 ```
 
 脚本只会 source `/opt/ros/humble/setup.bash`，随后从本仓库 `src/` 构建全部
-14 个 ROS 包。构建成功后可以确认各程序确实来自本仓库：
+15 个 ROS 包。构建成功后可以确认各程序确实来自本仓库：
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/ele_scout_kit/install/local_setup.bash
+source ~/eletranskit_scout/install/local_setup.bash
 ros2 pkg prefix fixposition_driver_ros2
 ros2 pkg prefix rslidar_sdk
 ros2 pkg prefix elevation_mapping_cupy
 ros2 pkg prefix ht_traversability_ros2
+ros2 pkg prefix zt_traversability_ros2
 ```
 
 四个输出都应位于当前 clone 目录的 `install/`。
@@ -67,7 +71,7 @@ ros2 pkg prefix ht_traversability_ros2
 发布：
 
 ```bash
-cd ~/ele_scout_kit
+cd ~/eletranskit_scout
 ./start_real_car.sh
 ```
 
