@@ -5,6 +5,17 @@
     base_frame: FP_POI
     initialize_frame_id: [FP_POI]
 
+    # Explicitly enable common-mode Z-drift compensation. Motion gating is
+    # driven by consecutive map<-LiDAR TF poses in the ROS2 point-cloud path.
+    enable_drift_compensation: true
+    min_height_drift_cnt: 100
+    max_drift: 0.10
+    drift_compensation_alpha: 0.10
+    position_noise_thresh: 0.01
+    orientation_noise_thresh: 0.01
+    position_lowpass_alpha: 0.20
+    orientation_lowpass_alpha: 0.20
+
     # The live RoboSense publisher offers RELIABLE. Match it and keep only a
     # very short queue so a transient scheduling delay does not silently lose
     # a complete 360-degree scan or accumulate stale scans.

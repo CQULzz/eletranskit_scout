@@ -166,6 +166,12 @@ class ElevationMap:
         # Initial mean_error
         self.mean_error = 0.0
         self.additive_mean_error = 0.0
+        self.drift_inlier_count = 0
+        self.drift_mean_error = math.nan
+        self.drift_applied_correction = 0.0
+        self.drift_cumulative_correction = 0.0
+        self.drift_motion_gate_open = False
+        self.drift_applied = False
 
         self.compile_kernels()
 
@@ -201,6 +207,12 @@ class ElevationMap:
 
         self.mean_error = 0.0
         self.additive_mean_error = 0.0
+        self.drift_inlier_count = 0
+        self.drift_mean_error = math.nan
+        self.drift_applied_correction = 0.0
+        self.drift_cumulative_correction = 0.0
+        self.drift_motion_gate_open = False
+        self.drift_applied = False
 
     def get_center_position(self, position):
         """Return the position of the map center.
@@ -431,19 +443,30 @@ class ElevationMap:
                 self.error_cnt,
                 size=(points.shape[0]),
             )
+            self.drift_inlier_count = int(self.error_cnt[0].item())
+            self.drift_mean_error = math.nan
+            self.drift_applied_correction = 0.0
+            self.drift_motion_gate_open = bool(
+                position_noise > self.param.position_noise_thresh
+                or orientation_noise > self.param.orientation_noise_thresh
+            )
+            self.drift_applied = False
             if (
                 self.param.enable_drift_compensation
-                and self.error_cnt > self.param.min_height_drift_cnt
-                and (
-                    position_noise > self.param.position_noise_thresh
-                    or orientation_noise > self.param.orientation_noise_thresh
-                )
+                and self.drift_inlier_count > self.param.min_height_drift_cnt
+                and self.drift_motion_gate_open
             ):
-                self.mean_error = self.error / self.error_cnt
+                self.mean_error = float(
+                    (self.error[0] / self.error_cnt[0]).item()
+                )
+                self.drift_mean_error = self.mean_error
                 self.additive_mean_error += self.mean_error
-                if np.abs(self.mean_error) < self.param.max_drift:
+                if abs(self.mean_error) < self.param.max_drift:
                     correction = self.mean_error * self.param.drift_compensation_alpha
                     self.map_snapshot[0] += correction
+                    self.drift_applied_correction = float(correction)
+                    self.drift_cumulative_correction += float(correction)
+                    self.drift_applied = True
             self.add_points_kernel(
                 self.center[:1],
                 self.center[1:2],
@@ -489,6 +512,16 @@ class ElevationMap:
                 self.elevation_map[3][3:-3, 3:-3] = traversability.reshape(
                     (traversability.shape[2], traversability.shape[3])
                 )
+            else:
+                # The drift estimator still uses layer 3 as a confidence gate.
+                # Keep it neutral for valid cells when the mapper's legacy
+                # traversability network is disabled; otherwise newly shifted-in
+                # cells stay at zero and Z compensation dies after one map length.
+                self.elevation_map[3] = cp.where(
+                    self.elevation_map[2] > 0.5,
+                    1.0,
+                    0.0,
+                )
             self.plugin_manager.reset_layers()
 
         if self.param.enable_normal_estimation:
@@ -520,6 +553,21 @@ class ElevationMap:
 
         """
         return self.additive_mean_error
+
+    def get_drift_compensation_status(self):
+        """Return the latest Z-drift decision without exposing GPU arrays."""
+        with self.map_lock:
+            return {
+                "enabled": bool(self.param.enable_drift_compensation),
+                "motion_gate_open": bool(self.drift_motion_gate_open),
+                "inlier_count": int(self.drift_inlier_count),
+                "mean_error_m": float(self.drift_mean_error),
+                "applied_correction_m": float(self.drift_applied_correction),
+                "cumulative_correction_m": float(
+                    self.drift_cumulative_correction
+                ),
+                "applied": bool(self.drift_applied),
+            }
 
     def update_variance(self):
         """Adds the time variacne to the valid cells."""

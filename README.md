@@ -222,6 +222,7 @@ ros2 topic hz /elevation_mapping_node/elevation_map_raw
 ros2 topic hz /elevation_mapping_node/elevation_map_global
 ros2 topic hz /elevation_mapping_node/elevation_map_global_tiles
 ros2 topic hz /elevation_mapping_node/elevation_map_global_local
+ros2 topic echo /elevation_mapping_node/drift_compensation_status
 ros2 topic hz /ht_traversability/global_local
 ros2 run tf2_ros tf2_echo odom FP_POI
 ros2 run tf2_ros tf2_echo odom rslidar
@@ -230,6 +231,10 @@ ros2 run tf2_ros tf2_echo odom rslidar
 如果地图不显示，优先检查 `odom -> rslidar` 是否连通、FP 是否已输出
 `FP_ECEF -> FP_ENU0` 和 `FP_ECEF -> FP_POI`，以及 RViz Fixed Frame 是否为
 `odom`。
+
+实车配置已启用基于相邻点云 TF 运动门控的公共 Z 轴漂移补偿。状态数组字段、
+安全门限、32 线 LiDAR 的 A/B 验收方案及回退方法见
+[Z_AXIS_DRIFT_COMPENSATION_PLAN_20260903.md](Z_AXIS_DRIFT_COMPENSATION_PLAN_20260903.md)。
 
 ## 系统依赖
 

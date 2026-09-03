@@ -85,6 +85,11 @@ if(BUILD_TESTING)
     TIMEOUT 120
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
   )
+  ament_add_pytest_test(test_pose_motion
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pose_motion.py
+    TIMEOUT 120
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+  )
   ament_add_pytest_test(test_inpainting_plugin
     ${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}/tests/test_inpainting_plugin.py
     TIMEOUT 120

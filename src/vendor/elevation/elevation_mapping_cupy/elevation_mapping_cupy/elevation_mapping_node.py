@@ -44,6 +44,7 @@ from elevation_mapping_cupy.global_map import (
     downsample_elevation_blocks,
 )
 from elevation_mapping_cupy.gridmap_utils import encode_layer_to_multiarray, decode_multiarray_to_rows_cols
+from elevation_mapping_cupy.pose_motion import PoseMotionDetector
 
 PDC_DATATYPE = {
     "1": np.int8,
@@ -237,10 +238,23 @@ class ElevationMappingNode(Node):
         self._pointcloud_process_counter = 0
         self._image_process_counter = 0
         self._map = ElevationMap(self.param)
+        self._drift_motion_detector = PoseMotionDetector(
+            self.position_lowpass_alpha,
+            self.orientation_lowpass_alpha,
+        )
         self._map_data = np.zeros(
             (self._map.cell_n - 2, self._map.cell_n - 2), dtype=np.float32
         )
         self.get_logger().info(f"Initialized map with length: {self._map.map_length}, resolution: {self._map.resolution}, cells: {self._map.cell_n}")
+        if self.param.enable_drift_compensation:
+            self.get_logger().info(
+                "Z-drift compensation enabled: "
+                f"position threshold={self.param.position_noise_thresh:.4f} m, "
+                f"orientation threshold={self.param.orientation_noise_thresh:.4f} rad, "
+                f"minimum inliers>{self.param.min_height_drift_cnt}, "
+                f"gain={self.param.drift_compensation_alpha:.3f}, "
+                f"maximum mean error={self.param.max_drift:.3f} m."
+            )
         self._global_map = None
         self._global_map_data = None
         self._global_map_variance_data = None
@@ -773,6 +787,11 @@ class ElevationMappingNode(Node):
         self._received_cloud_publisher = self.create_publisher(
             UInt64,
             f"/{self.get_name()}/received_pointcloud_count",
+            10,
+        )
+        self._drift_compensation_publisher = self.create_publisher(
+            Float32MultiArray,
+            f"/{self.get_name()}/drift_compensation_status",
             10,
         )
 
@@ -1929,7 +1948,44 @@ class ElevationMappingNode(Node):
             t_np = np.array([t.x, t.y, t.z], dtype=np.float32)
             R = quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3].astype(np.float32)
 
-        self._map.input_pointcloud(pts, channels, R, t_np, 0, 0)
+        position_motion, orientation_motion = self._drift_motion_detector.update(
+            sub_key,
+            t_np,
+            R,
+        )
+        self._map.input_pointcloud(
+            pts,
+            channels,
+            R,
+            t_np,
+            position_motion,
+            orientation_motion,
+        )
+        drift_status = self._map.get_drift_compensation_status()
+        drift_message = Float32MultiArray()
+        drift_message.layout.dim.append(
+            MAD(
+                label=(
+                    "enabled,motion_gate_open,position_motion_m,"
+                    "orientation_motion_rad,inlier_count,mean_error_m,"
+                    "applied_correction_m,cumulative_correction_m,applied"
+                ),
+                size=9,
+                stride=9,
+            )
+        )
+        drift_message.data = [
+            float(drift_status["enabled"]),
+            float(drift_status["motion_gate_open"]),
+            float(position_motion),
+            float(orientation_motion),
+            float(drift_status["inlier_count"]),
+            float(drift_status["mean_error_m"]),
+            float(drift_status["applied_correction_m"]),
+            float(drift_status["cumulative_correction_m"]),
+            float(drift_status["applied"]),
+        ]
+        self._drift_compensation_publisher.publish(drift_message)
         self._pointcloud_process_counter += 1
         if self.enable_global_map:
             self._mark_global_map_dirty(msg.header.stamp)
