@@ -179,9 +179,12 @@ class GlobalHtGifRecorder(Node):
         self.saved_count = 0
         self.skipped_stride = 0
         self.skipped_missing_local = 0
+        self.skipped_missing_global = 0
         self.last_saved_stamp: int | None = None
         self.latest_global: GridMap | None = None
+        self.global_by_stamp: dict[int, GridMap] = {}
         self.local_by_stamp: dict[int, GridMap] = {}
+        self.pending_ht_by_stamp: dict[int, tuple[GridMap, GridMap, int]] = {}
         self.frame_paths: list[Path] = []
         self.robot_track: list[tuple[float, float]] = []
         self.alignment_results: list[tuple[float, float]] = []
@@ -235,6 +238,19 @@ class GlobalHtGifRecorder(Node):
     def _global(self, message: GridMap) -> None:
         self.global_count += 1
         self.latest_global = message
+        key = stamp_ns(message)
+        self.global_by_stamp[key] = message
+        pending = self.pending_ht_by_stamp.pop(key, None)
+        if pending is not None:
+            local, ht, source_ht_index = pending
+            try:
+                self._save_frame(message, local, ht, key, source_ht_index)
+                self.last_saved_stamp = key
+            except Exception as exc:
+                self.get_logger().error(f"Failed to render stamp {key}: {exc}")
+        if len(self.global_by_stamp) > 200:
+            for stale in sorted(self.global_by_stamp)[:-100]:
+                del self.global_by_stamp[stale]
 
     def _local(self, message: GridMap) -> None:
         self.local_count += 1
@@ -260,14 +276,33 @@ class GlobalHtGifRecorder(Node):
         if self.ht_count % self.frame_stride != 0:
             self.skipped_stride += 1
             return
+        global_message = self.global_by_stamp.pop(key, None)
+        if global_message is None:
+            # The persistent global and local timers publish the same map
+            # revision with the same source-cloud stamp, but the local crop
+            # commonly reaches HT before the matching global view reaches
+            # this recorder.  Defer rendering instead of pairing it with a
+            # visually similar but different revision.
+            self.pending_ht_by_stamp[key] = (local, message, self.ht_count)
+            if len(self.pending_ht_by_stamp) > 200:
+                stale = sorted(self.pending_ht_by_stamp)[:-100]
+                self.skipped_missing_global += len(stale)
+                for stale_key in stale:
+                    del self.pending_ht_by_stamp[stale_key]
+            return
         try:
-            self._save_frame(self.latest_global or local, local, message, key)
+            self._save_frame(global_message, local, message, key, self.ht_count)
             self.last_saved_stamp = key
         except Exception as exc:
             self.get_logger().error(f"Failed to render stamp {key}: {exc}")
 
     def _save_frame(
-        self, global_message: GridMap, local_message: GridMap, ht_message: GridMap, key: int
+        self,
+        global_message: GridMap,
+        local_message: GridMap,
+        ht_message: GridMap,
+        key: int,
+        source_ht_index: int,
     ) -> None:
         global_layers = layers(global_message)
         local_layers = layers(local_message)
@@ -448,7 +483,7 @@ class GlobalHtGifRecorder(Node):
         self._manifest.writerow(
             {
                 "gif_frame_index": self.saved_count,
-                "source_ht_index": self.ht_count,
+                "source_ht_index": source_ht_index,
                 "stamp_ns": key,
                 "global_revision_frame": self.global_count,
                 "local_center_x_m": robot_x,
@@ -473,6 +508,8 @@ class GlobalHtGifRecorder(Node):
         if self._finalized:
             return
         self._finalized = True
+        self.skipped_missing_global += len(self.pending_ht_by_stamp)
+        self.pending_ht_by_stamp.clear()
         self._manifest_handle.flush()
         self._manifest_handle.close()
         gif_path = self.output_dir / "global_to_local_to_ht.gif"
@@ -505,6 +542,7 @@ class GlobalHtGifRecorder(Node):
             "saved_gif_frames": self.saved_count,
             "skipped_by_stride": self.skipped_stride,
             "skipped_missing_local": self.skipped_missing_local,
+            "skipped_missing_global": self.skipped_missing_global,
             "gif_frame_duration_ms": self.gif_frame_ms,
             "conservative_threshold": CONSERVATIVE_THRESHOLD,
             "gif_file": str(gif_path) if gif_path.exists() else "",

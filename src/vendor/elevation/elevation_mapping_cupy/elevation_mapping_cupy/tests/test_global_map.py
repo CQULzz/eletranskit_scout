@@ -23,20 +23,68 @@ def _make_global(**overrides):
     return result
 
 
-def test_latest_valid_wins_and_nan_does_not_erase_history():
+def test_variance_weighted_fusion_and_nan_does_not_erase_history():
     global_map = _make_global()
     first = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-    result = global_map.fuse_snapshot((0.0, 0.0), first)
+    variance = np.ones_like(first)
+    result = global_map.fuse_snapshot((0.0, 0.0), first, variance)
 
     assert result.written_cells == 4
     assert result.touched_tiles == 4  # The origin crosses four signed tiles.
     assert set(global_map.all_tile_keys()) == {(-1, -1), (0, -1), (-1, 0), (0, 0)}
 
-    second = np.array([[9.0, np.nan], [np.nan, 8.0]], dtype=np.float32)
-    global_map.fuse_snapshot((0.0, 0.0), second)
+    second = np.array([[1.2, np.nan], [np.nan, 3.8]], dtype=np.float32)
+    global_map.fuse_snapshot((0.0, 0.0), second, variance)
     window = global_map.extract_window((0.0, 0.0), 2.0, 2.0)
-    expected = np.array([[9.0, 2.0], [3.0, 8.0]], dtype=np.float32)
-    assert np.array_equal(window.elevation_yx, expected)
+    expected = np.array([[1.1, 2.0], [3.0, 3.9]], dtype=np.float32)
+    assert np.allclose(window.elevation_yx, expected)
+    assert np.allclose(
+        window.variance_yx,
+        np.array([[0.5, 1.0], [1.0, 0.5]], dtype=np.float32),
+    )
+    assert np.array_equal(
+        window.observation_count_yx,
+        np.array([[2.0, 1.0], [1.0, 2.0]], dtype=np.float32),
+    )
+
+
+def test_only_explicitly_updated_cells_are_fused():
+    global_map = _make_global()
+    first = np.ones((2, 2), dtype=np.float32)
+    variance = np.ones_like(first)
+    global_map.fuse_snapshot((0.0, 0.0), first, variance)
+
+    second = np.full((2, 2), 1.2, dtype=np.float32)
+    updated = np.array([[True, False], [False, False]])
+    result = global_map.fuse_snapshot(
+        (0.0, 0.0), second, variance, updated
+    )
+    window = global_map.extract_window((0.0, 0.0), 2.0, 2.0)
+
+    assert result.valid_input_cells == 1
+    assert result.written_cells == 1
+    assert np.allclose(
+        window.elevation_yx,
+        np.array([[1.1, 1.0], [1.0, 1.0]], dtype=np.float32),
+    )
+
+
+def test_large_conflicting_height_is_rejected():
+    global_map = _make_global()
+    variance = np.full((2, 2), 0.01, dtype=np.float32)
+    global_map.fuse_snapshot(
+        (0.0, 0.0), np.ones((2, 2), dtype=np.float32), variance
+    )
+    result = global_map.fuse_snapshot(
+        (0.0, 0.0), np.full((2, 2), 2.0, dtype=np.float32), variance
+    )
+
+    assert result.written_cells == 0
+    assert result.rejected_cells == 4
+    assert np.all(
+        global_map.extract_window((0.0, 0.0), 2.0, 2.0).elevation_yx
+        == 1.0
+    )
 
 
 def test_far_jump_allocates_only_observed_tiles_not_intermediate_rectangle():

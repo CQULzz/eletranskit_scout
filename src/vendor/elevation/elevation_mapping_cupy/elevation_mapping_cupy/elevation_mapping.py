@@ -74,14 +74,20 @@ class GridGeometry:
 
 @dataclass
 class ElevationSnapshotBuffer:
-    """Reusable GPU and pinned-CPU storage for one global-map snapshot."""
+    """Reusable GPU and pinned-CPU storage for one global-map observation."""
 
     elevation_gpu: Any
+    variance_gpu: Any
+    updated_gpu: Any
     center_gpu: Any
     elevation_cpu: np.ndarray
+    variance_cpu: np.ndarray
+    updated_cpu: np.ndarray
     center_cpu: np.ndarray
     ready_event: Any
     elevation_pinned_memory: Any
+    variance_pinned_memory: Any
+    updated_pinned_memory: Any
     center_pinned_memory: Any
     stamp: Any = None
     generation: int = 0
@@ -126,6 +132,13 @@ class ElevationMap:
         # use an RLock so move_to can reuse the existing locked shift helpers.
         self.map_lock = threading.RLock()
         self.elevation_map = xp.zeros((7, self.cell_n, self.cell_n), dtype=self.data_type)
+        # Cells touched by one or more point-cloud endpoint updates since the
+        # last persistent-global snapshot.  This is deliberately separate
+        # from the time layer: a busy asynchronous copier may skip a capture
+        # opportunity, so updates must accumulate until they are consumed.
+        self.global_update_mask = xp.zeros(
+            (self.cell_n, self.cell_n), dtype=xp.bool_
+        )
         self.layer_names = [
             "elevation",
             "variance",
@@ -181,6 +194,7 @@ class ElevationMap:
         """Reset all the layers of the elevation & the semantic map."""
         with self.map_lock:
             self.elevation_map *= 0.0
+            self.global_update_mask.fill(False)
             # Initial variance
             self.elevation_map[1] += self.initial_variance
             self.plugin_manager.reset_layers()
@@ -279,8 +293,19 @@ class ElevationMap:
             return
         with self.map_lock:
             self.elevation_map = cp.roll(self.elevation_map, shift_value, axis=(1, 2))
+            self.global_update_mask = cp.roll(
+                self.global_update_mask, shift_value, axis=(0, 1)
+            )
             self.pad_value(self.elevation_map, shift_value, value=0.0)
             self.pad_value(self.elevation_map, shift_value, idx=1, value=self.initial_variance)
+            if shift_value[0] > 0:
+                self.global_update_mask[: shift_value[0], :] = False
+            elif shift_value[0] < 0:
+                self.global_update_mask[shift_value[0] :, :] = False
+            if shift_value[1] > 0:
+                self.global_update_mask[:, : shift_value[1]] = False
+            elif shift_value[1] < 0:
+                self.global_update_mask[:, shift_value[1] :] = False
             # Plugin layers are computed on-demand; invalidate cache when shifting.
             self.plugin_manager.reset_layers()
 
@@ -439,6 +464,7 @@ class ElevationMap:
                 self.elevation_map,
                 size=(self.cell_n * self.cell_n),
             )
+            self.global_update_mask |= self.new_map[2] > 0.0
 
             if self.param.enable_overlap_clearance:
                 self.clear_overlap_map(t)
@@ -740,7 +766,7 @@ class ElevationMap:
             return np
 
     def copy_to_cpu(self, array, data, stream=None):
-        """Transforms the data to float32 and if on gpu loads it to cpu.
+        """Convert to the destination dtype and copy a CPU/GPU array to CPU.
 
         Args:
             array (cupy._core.core.ndarray):
@@ -748,9 +774,9 @@ class ElevationMap:
             stream (Union[None, cupy.cuda.stream.Stream, None, None, None, None, None, None, None]):
         """
         if type(array) == np.ndarray:
-            data[...] = array.astype(np.float32, copy=False)
+            data[...] = array.astype(data.dtype, copy=False)
         elif type(array) == cp.ndarray:
-            source = array.astype(np.float32, copy=False)
+            source = array.astype(data.dtype, copy=False)
             if stream is not None:
                 cp.asnumpy(source, stream=stream, out=data)
             else:
@@ -787,25 +813,93 @@ class ElevationMap:
             center = cp.asnumpy(self.center).astype(np.float64, copy=False)
         return center, data
 
+    def export_global_observation(
+        self,
+        elevation_data=None,
+        variance_data=None,
+        updated_data=None,
+    ):
+        """Copy newly updated rolling cells for probabilistic global fusion.
+
+        Unlike :meth:`export_elevation_snapshot`, this exports variance and an
+        accumulated update mask, then atomically consumes that mask.  Cells
+        merely carried in the rolling posterior are not presented as new,
+        independent global observations.
+        """
+
+        shape = (self.cell_n - 2, self.cell_n - 2)
+        if elevation_data is None:
+            elevation_data = np.empty(shape, dtype=np.float32)
+        if variance_data is None:
+            variance_data = np.empty(shape, dtype=np.float32)
+        if updated_data is None:
+            updated_data = np.empty(shape, dtype=np.uint8)
+        for name, array, dtype in (
+            ("elevation", elevation_data, np.float32),
+            ("variance", variance_data, np.float32),
+            ("updated", updated_data, np.uint8),
+        ):
+            if array.shape != shape or array.dtype != dtype:
+                raise ValueError(
+                    f"Global {name} snapshot buffer must have shape {shape} "
+                    f"and dtype {dtype}, got {array.shape} {array.dtype}."
+                )
+
+        with self.map_lock:
+            valid = self.elevation_map[2, 1:-1, 1:-1] > 0.5
+            updated = self.global_update_mask[1:-1, 1:-1] & valid
+            elevation = cp.where(
+                updated,
+                self.elevation_map[0, 1:-1, 1:-1] + self.center[2],
+                cp.nan,
+            )
+            variance = cp.where(
+                updated,
+                self.elevation_map[1, 1:-1, 1:-1],
+                cp.nan,
+            )
+            self.copy_to_cpu(elevation, elevation_data)
+            self.copy_to_cpu(variance, variance_data)
+            self.copy_to_cpu(updated.astype(cp.uint8), updated_data)
+            center = cp.asnumpy(self.center).astype(np.float64, copy=False)
+            self.global_update_mask.fill(False)
+        return center, elevation_data, variance_data, updated_data
+
     def create_elevation_snapshot_buffer(self) -> ElevationSnapshotBuffer:
         """Allocate one reusable device snapshot and pinned host destination."""
 
         shape = (self.cell_n - 2, self.cell_n - 2)
         elevation_bytes = int(np.prod(shape)) * np.dtype(np.float32).itemsize
+        variance_bytes = elevation_bytes
+        updated_bytes = int(np.prod(shape)) * np.dtype(np.uint8).itemsize
         center_bytes = 3 * np.dtype(np.float32).itemsize
         elevation_memory = cp.cuda.alloc_pinned_memory(elevation_bytes)
+        variance_memory = cp.cuda.alloc_pinned_memory(variance_bytes)
+        updated_memory = cp.cuda.alloc_pinned_memory(updated_bytes)
         center_memory = cp.cuda.alloc_pinned_memory(center_bytes)
         elevation_cpu = np.frombuffer(
             elevation_memory, dtype=np.float32, count=int(np.prod(shape))
         ).reshape(shape)
         center_cpu = np.frombuffer(center_memory, dtype=np.float32, count=3)
+        variance_cpu = np.frombuffer(
+            variance_memory, dtype=np.float32, count=int(np.prod(shape))
+        ).reshape(shape)
+        updated_cpu = np.frombuffer(
+            updated_memory, dtype=np.uint8, count=int(np.prod(shape))
+        ).reshape(shape)
         return ElevationSnapshotBuffer(
             elevation_gpu=cp.empty(shape, dtype=cp.float32),
+            variance_gpu=cp.empty(shape, dtype=cp.float32),
+            updated_gpu=cp.empty(shape, dtype=cp.uint8),
             center_gpu=cp.empty(3, dtype=cp.float32),
             elevation_cpu=elevation_cpu,
+            variance_cpu=variance_cpu,
+            updated_cpu=updated_cpu,
             center_cpu=center_cpu,
             ready_event=cp.cuda.Event(disable_timing=True),
             elevation_pinned_memory=elevation_memory,
+            variance_pinned_memory=variance_memory,
+            updated_pinned_memory=updated_memory,
             center_pinned_memory=center_memory,
         )
 
@@ -828,12 +922,20 @@ class ElevationMap:
             )
         with self.map_lock:
             valid = self.elevation_map[2, 1:-1, 1:-1] > 0.5
+            updated = self.global_update_mask[1:-1, 1:-1] & valid
             buffer.elevation_gpu[...] = cp.where(
-                valid,
+                updated,
                 self.elevation_map[0, 1:-1, 1:-1] + self.center[2],
                 cp.nan,
             )
+            buffer.variance_gpu[...] = cp.where(
+                updated,
+                self.elevation_map[1, 1:-1, 1:-1],
+                cp.nan,
+            )
+            buffer.updated_gpu[...] = updated
             buffer.center_gpu[...] = self.center
+            self.global_update_mask.fill(False)
             # All map updates and this device copy use the current stream. The
             # event lets a separate copy stream wait only for this snapshot,
             # not for point-cloud kernels submitted afterwards.
@@ -843,7 +945,7 @@ class ElevationMap:
     def materialize_elevation_snapshot(
         buffer: ElevationSnapshotBuffer,
         stream,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Asynchronously download one captured snapshot, then wait in worker."""
 
         with stream:
@@ -855,13 +957,30 @@ class ElevationMap:
                 blocking=False,
             )
             cp.asnumpy(
+                buffer.variance_gpu,
+                stream=stream,
+                out=buffer.variance_cpu,
+                blocking=False,
+            )
+            cp.asnumpy(
+                buffer.updated_gpu,
+                stream=stream,
+                out=buffer.updated_cpu,
+                blocking=False,
+            )
+            cp.asnumpy(
                 buffer.center_gpu,
                 stream=stream,
                 out=buffer.center_cpu,
                 blocking=False,
             )
         stream.synchronize()
-        return buffer.center_cpu, buffer.elevation_cpu
+        return (
+            buffer.center_cpu,
+            buffer.elevation_cpu,
+            buffer.variance_cpu,
+            buffer.updated_cpu,
+        )
 
     def trim_memory_pool(self):
         """Release cached CuPy allocator blocks that are not currently in use."""

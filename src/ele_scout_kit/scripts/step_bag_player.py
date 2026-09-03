@@ -31,7 +31,7 @@ import rclpy
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from rclpy.qos import QoSPresetProfiles
+from rclpy.qos import QoSProfile, QoSPresetProfiles, ReliabilityPolicy
 from rclpy.serialization import deserialize_message
 from rosbag2_interfaces.srv import Burst
 from sensor_msgs.msg import PointCloud2
@@ -449,7 +449,10 @@ class StepController(Node):
             self.cloud_publisher = self.create_publisher(
                 PointCloud2,
                 CLOUD_TOPIC,
-                QoSPresetProfiles.get_from_short_key("sensor_data"),
+                # Direct frame-controlled replay must not silently lose a
+                # multi-megabyte cloud.  Reliable delivery also matches the
+                # live mapping subscriber used by the kit.
+                QoSProfile(depth=2, reliability=ReliabilityPolicy.RELIABLE),
             )
 
     def _acknowledgement_callback(self, message: UInt64) -> None:

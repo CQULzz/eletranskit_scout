@@ -13,6 +13,7 @@ install(
 install(
   PROGRAMS
     scripts/global_ht_gif_recorder.py
+    scripts/ht_diagnostic_frame_recorder.py
     scripts/ht_fps_probe.py
     scripts/render_ht_gif_with_fps.py
     scripts/step_bag_player.py

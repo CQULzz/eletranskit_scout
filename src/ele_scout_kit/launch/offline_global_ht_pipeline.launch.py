@@ -44,6 +44,10 @@ def generate_launch_description():
                 "use_sim_time": False,
                 "global_map_storage_path": database_path,
                 "global_map_resume_from_disk": False,
+                # Recorded Fixposition ENU coordinates are not guaranteed to
+                # lie near (0, 0).  Center the finite visualization window on
+                # the vehicle while the SQLite tile store remains unbounded.
+                "global_map_view_follow_robot": True,
                 "global_map_publish_fps": 10.0,
                 "global_map_local_publish_fps": 10.0,
                 "global_map_flush_fps": 2.0,
@@ -71,8 +75,8 @@ def generate_launch_description():
     )
     recorder = Node(
         package="ele_scout_kit",
-        executable="global_ht_gif_recorder.py",
-        name="global_ht_gif_recorder",
+        executable="ht_diagnostic_frame_recorder.py",
+        name="ht_diagnostic_frame_recorder",
         output="screen",
         arguments=[
             output_dir,
@@ -88,7 +92,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "output_dir",
                 default_value="/tmp/global_ht_pipeline",
-                description="Directory for synchronized PNG frames, GIF, and summary.",
+                description="Directory for synchronized detailed PNG frames, GIF, and summary.",
             ),
             DeclareLaunchArgument(
                 "database_path",

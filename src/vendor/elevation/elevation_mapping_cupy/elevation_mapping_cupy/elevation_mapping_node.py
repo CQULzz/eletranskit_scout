@@ -243,6 +243,8 @@ class ElevationMappingNode(Node):
         self.get_logger().info(f"Initialized map with length: {self._map.map_length}, resolution: {self._map.resolution}, cells: {self._map.cell_n}")
         self._global_map = None
         self._global_map_data = None
+        self._global_map_variance_data = None
+        self._global_map_updated_data = None
         self._global_map_dirty = False
         self._global_map_stamp = None
         self._global_map_pending_stamp = None
@@ -261,6 +263,8 @@ class ElevationMappingNode(Node):
         self._global_snapshot_replaced_count = 0
         self._global_snapshot_fused_count = 0
         self._global_snapshot_skipped_count = 0
+        self._global_fused_cell_count = 0
+        self._global_rejected_cell_count = 0
         self._global_fusion_last_log_time = 0.0
         if self.enable_global_map:
             self._global_map = GlobalMapAccumulator(
@@ -270,19 +274,35 @@ class ElevationMappingNode(Node):
                 storage_path=self.global_map_storage_path,
                 resume_from_disk=self.global_map_resume_from_disk,
                 map_frame=self.map_frame,
+                variance_floor=self.global_map_fusion_variance_floor,
+                variance_ceiling=self.global_map_fusion_variance_ceiling,
+                outlier_sigma=self.global_map_outlier_sigma,
+                max_height_jump=self.global_map_max_height_jump,
             )
             local_shape = (self._map.cell_n - 2, self._map.cell_n - 2)
             self._global_map.initialize_lattice(local_shape)
             self._global_map_data = np.empty(local_shape, dtype=np.float32)
+            self._global_map_variance_data = np.empty(
+                local_shape, dtype=np.float32
+            )
+            self._global_map_updated_data = np.empty(
+                local_shape, dtype=np.uint8
+            )
             self._global_map.flush(wait=True)
             tile_length = self.global_map_tile_size_cells * self._map.resolution
-            tile_memory_kib = self.global_map_tile_size_cells ** 2 * 4.0 / 1024.0
+            tile_memory_kib = (
+                self.global_map_tile_size_cells ** 2 * 4.0 * 4.0 / 1024.0
+            )
             self.get_logger().info(
                 "Unbounded tiled global elevation map enabled: "
                 f"tile={self.global_map_tile_size_cells}x{self.global_map_tile_size_cells} "
                 f"cells ({tile_length:.2f} m, {tile_memory_kib:.0f} KiB), "
                 f"RAM cache={self.global_map_max_tiles_in_memory} tiles, "
-                f"storage='{self._global_map.storage_path or 'memory only'}'."
+                f"storage='{self._global_map.storage_path or 'memory only'}', "
+                "fusion=variance-weighted updated-cells-only "
+                f"(floor={self.global_map_fusion_variance_floor:.6f}, "
+                f"sigma={self.global_map_outlier_sigma:.2f}, "
+                f"max_jump={self.global_map_max_height_jump:.3f} m)."
             )
             if self.global_map_resume_from_disk:
                 self.get_logger().warning(
@@ -371,6 +391,10 @@ class ElevationMappingNode(Node):
             'global_map_local_publish_fps': 5.0,
             'global_map_async_fusion': False,
             'global_map_snapshot_buffer_count': 2,
+            'global_map_fusion_variance_floor': 0.0025,
+            'global_map_fusion_variance_ceiling': 4.0,
+            'global_map_outlier_sigma': 3.0,
+            'global_map_max_height_jump': 0.30,
             'global_map_flush_fps': 1.0,
             'global_map_tiles_publish_fps': 2.0,
             'global_map_tiles_per_message': 8,
@@ -400,6 +424,18 @@ class ElevationMappingNode(Node):
         self.global_map_async_fusion = bool(self.get_parameter('global_map_async_fusion').value)
         self.global_map_snapshot_buffer_count = int(
             self.get_parameter('global_map_snapshot_buffer_count').value
+        )
+        self.global_map_fusion_variance_floor = float(
+            self.get_parameter('global_map_fusion_variance_floor').value
+        )
+        self.global_map_fusion_variance_ceiling = float(
+            self.get_parameter('global_map_fusion_variance_ceiling').value
+        )
+        self.global_map_outlier_sigma = float(
+            self.get_parameter('global_map_outlier_sigma').value
+        )
+        self.global_map_max_height_jump = float(
+            self.get_parameter('global_map_max_height_jump').value
         )
         self.global_map_flush_fps = float(self.get_parameter('global_map_flush_fps').value)
         self.global_map_tiles_publish_fps = float(self.get_parameter('global_map_tiles_publish_fps').value)
@@ -434,6 +470,23 @@ class ElevationMappingNode(Node):
             raise ValueError('global_map_visualization_stride must be positive.')
         if self.global_map_snapshot_buffer_count < 2:
             raise ValueError('global_map_snapshot_buffer_count must be at least 2.')
+        if (
+            not math.isfinite(self.global_map_fusion_variance_floor)
+            or self.global_map_fusion_variance_floor <= 0.0
+        ):
+            raise ValueError('global_map_fusion_variance_floor must be finite and positive.')
+        if (
+            not math.isfinite(self.global_map_fusion_variance_ceiling)
+            or self.global_map_fusion_variance_ceiling
+            < self.global_map_fusion_variance_floor
+        ):
+            raise ValueError(
+                'global_map_fusion_variance_ceiling must be finite and no smaller than the floor.'
+            )
+        if not math.isfinite(self.global_map_outlier_sigma) or self.global_map_outlier_sigma <= 0.0:
+            raise ValueError('global_map_outlier_sigma must be finite and positive.')
+        if not math.isfinite(self.global_map_max_height_jump) or self.global_map_max_height_jump <= 0.0:
+            raise ValueError('global_map_max_height_jump must be finite and positive.')
         self_filter_defaults = {
             'self_filter_enabled': False,
             'self_filter_min_x': -1.0,
@@ -886,7 +939,13 @@ class ElevationMappingNode(Node):
     def _start_global_fusion_worker(self) -> None:
         """Start a latest-only GPU snapshot to CPU tile-fusion worker."""
 
-        self._global_fusion_queue = queue.Queue(maxsize=1)
+        # No captured observation may be replaced: the exported mask contains
+        # only newly updated cells, so dropping a queued snapshot would lose
+        # measurements permanently. If all slots are busy, the GPU-side mask
+        # keeps accumulating until a later capture succeeds.
+        self._global_fusion_queue = queue.Queue(
+            maxsize=self.global_map_snapshot_buffer_count
+        )
         self._global_snapshot_free = queue.LifoQueue()
         for _ in range(self.global_map_snapshot_buffer_count):
             self._global_snapshot_free.put(
@@ -900,9 +959,9 @@ class ElevationMappingNode(Node):
         )
         self._global_fusion_thread.start()
         self.get_logger().info(
-            "Asynchronous latest-only global fusion enabled: "
+            "Asynchronous lossless global fusion enabled: "
             f"GPU snapshot buffers={self.global_map_snapshot_buffer_count}, "
-            "pending queue=1."
+            f"pending queue={self.global_map_snapshot_buffer_count}."
         )
 
     def _mark_global_map_dirty(self, stamp) -> None:
@@ -913,19 +972,12 @@ class ElevationMappingNode(Node):
             self._global_map_pending_stamp = stamp
 
     def _take_global_snapshot_slot(self):
-        """Get a free slot, reclaiming an obsolete queued snapshot if needed."""
+        """Get a free slot without discarding an unconsumed observation."""
 
         try:
             return self._global_snapshot_free.get_nowait()
         except queue.Empty:
-            pass
-        try:
-            stale = self._global_fusion_queue.get_nowait()
-        except queue.Empty:
             return None
-        self._global_fusion_queue.task_done()
-        self._global_snapshot_replaced_count += 1
-        return stale
 
     def _schedule_global_map_snapshot(self, force: bool = False) -> bool:
         """Capture the newest map on GPU and queue one asynchronous download."""
@@ -965,18 +1017,8 @@ class ElevationMappingNode(Node):
             self._global_map_pending_stamp = None
         self._global_snapshot_captured_count += 1
 
-        while True:
-            try:
-                self._global_fusion_queue.put_nowait(slot)
-                return True
-            except queue.Full:
-                try:
-                    stale = self._global_fusion_queue.get_nowait()
-                except queue.Empty:
-                    continue
-                self._global_fusion_queue.task_done()
-                self._global_snapshot_free.put(stale)
-                self._global_snapshot_replaced_count += 1
+        self._global_fusion_queue.put_nowait(slot)
+        return True
 
     def _global_fusion_worker_main(self) -> None:
         """Download captured GPU maps and update sparse CPU tiles."""
@@ -990,30 +1032,39 @@ class ElevationMappingNode(Node):
             except queue.Empty:
                 continue
             try:
-                center, elevation = self._map.materialize_elevation_snapshot(
-                    slot, copy_stream
-                )
+                (
+                    center,
+                    elevation,
+                    variance,
+                    updated,
+                ) = self._map.materialize_elevation_snapshot(slot, copy_stream)
                 with self._global_fusion_control_lock:
                     if slot.generation != self._global_map_generation:
                         continue
                     started = time.perf_counter()
-                    result = self._global_map.fuse_snapshot(center[:2], elevation)
+                    result = self._global_map.fuse_snapshot(
+                        center[:2], elevation, variance, updated
+                    )
                     elapsed_ms = (time.perf_counter() - started) * 1000.0
                 if result.written_cells > 0:
                     with self._global_map_state_lock:
                         self._global_map_stamp = slot.stamp
                     self._global_snapshot_fused_count += 1
+                self._global_fused_cell_count += result.written_cells
+                self._global_rejected_cell_count += result.rejected_cells
                 now = time.monotonic()
                 if now - self._global_fusion_last_log_time >= 5.0:
                     self.get_logger().info(
                         "Async global fusion %.1f ms; captured=%d fused=%d "
-                        "replaced=%d skipped=%d"
+                        "replaced=%d skipped=%d accepted_cells=%d rejected_cells=%d"
                         % (
                             elapsed_ms,
                             self._global_snapshot_captured_count,
                             self._global_snapshot_fused_count,
                             self._global_snapshot_replaced_count,
                             self._global_snapshot_skipped_count,
+                            self._global_fused_cell_count,
+                            self._global_rejected_cell_count,
                         )
                     )
                     self._global_fusion_last_log_time = now
@@ -1059,10 +1110,21 @@ class ElevationMappingNode(Node):
             return False
 
         try:
-            center, elevation = self._map.export_elevation_snapshot(
-                self._global_map_data
+            (
+                center,
+                elevation,
+                variance,
+                updated,
+            ) = self._map.export_global_observation(
+                self._global_map_data,
+                self._global_map_variance_data,
+                self._global_map_updated_data,
             )
-            result = self._global_map.fuse_snapshot(center[:2], elevation)
+            result = self._global_map.fuse_snapshot(
+                center[:2], elevation, variance, updated
+            )
+            self._global_fused_cell_count += result.written_cells
+            self._global_rejected_cell_count += result.rejected_cells
         except Exception as exc:
             self._report_global_map_failure("accumulation", exc)
             return False
@@ -1204,13 +1266,19 @@ class ElevationMappingNode(Node):
         gm.info.pose.orientation.y = 0.0
         gm.info.pose.orientation.z = 0.0
         gm.info.pose.orientation.w = 1.0
-        gm.layers = ['elevation']
+        gm.layers = [
+            'elevation',
+            'variance',
+            'observation_count',
+            'last_update_revision',
+        ]
         gm.basic_layers = ['elevation']
         gm.data = [
             self._numpy_to_multiarray(
-                window.elevation_grid_map_copy(),
+                window.layer_grid_map_copy(layer),
                 layout='gridmap_column',
             )
+            for layer in gm.layers
         ]
         gm.outer_start_index = 0
         gm.inner_start_index = 0

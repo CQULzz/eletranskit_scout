@@ -10,6 +10,9 @@ kit_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 bag_dir="$(realpath "$1")"
 output_dir="$2"
 domain_id="${3:-191}"
+wait_after="${OFFLINE_WAIT_AFTER:-1.0}"
+auto_steps="${OFFLINE_AUTO_STEPS:-999999}"
+frame_stride="${OFFLINE_FRAME_STRIDE:-1}"
 
 if [[ ! -f "${bag_dir}/metadata.yaml" ]]; then
   echo "not a ROS 2 bag: ${bag_dir}" >&2
@@ -59,7 +62,7 @@ trap cleanup EXIT INT TERM
 setsid ros2 launch ele_scout_kit offline_global_ht_pipeline.launch.py \
   output_dir:="${output_dir}/recording" \
   database_path:="${database_path}" \
-  frame_stride:=2 \
+  frame_stride:="${frame_stride}" \
   gif_frame_ms:=120 \
   >"${output_dir}/logs/pipeline.log" 2>&1 &
 pipeline_pid=$!
@@ -73,7 +76,7 @@ for _attempt in $(seq 1 240); do
   fi
   if rg -q "Unbounded tiled global elevation map enabled" "${output_dir}/logs/pipeline.log" \
     && rg -q "Ready: input=/elevation_mapping_node/elevation_map_global_local" "${output_dir}/logs/pipeline.log" \
-    && rg -q "Recording global/local/HT frames" "${output_dir}/logs/pipeline.log"; then
+    && rg -q "Recording detailed HT diagnostic frames" "${output_dir}/logs/pipeline.log"; then
     ready=1
     break
   fi
@@ -89,18 +92,18 @@ python3 "${kit_root}/install/ele_scout_kit/lib/ele_scout_kit/step_bag_player.py"
   "${bag_dir}" \
   --mode stable \
   --index-dir "${output_dir}/indexes" \
-  --auto-steps 999999 \
+  --auto-steps "${auto_steps}" \
   --ack-topic /elevation_mapping_node/processed_pointcloud_count \
   --receipt-topic /elevation_mapping_node/received_pointcloud_count \
   --ack-timeout 120.0 \
   --receipt-timeout 2.0 \
   --direct-cloud-publish \
-  --wait-after 1.0 \
+  --wait-after "${wait_after}" \
   >"${output_dir}/logs/player.log" 2>&1
 
 # Let the recorder consume the last queued HT frame before requesting GIF finalization.
 for _attempt in $(seq 1 60); do
-  received="$(rg -o 'Saved GIF source frames: [0-9]+' "${output_dir}/logs/pipeline.log" | tail -1 | awk '{print $5}')"
+  received="$(rg -o 'Saved detailed PNG frames: [0-9]+' "${output_dir}/logs/pipeline.log" | tail -1 | awk '{print $5}')"
   if [[ -n "${received}" ]]; then
     break
   fi

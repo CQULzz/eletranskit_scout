@@ -138,10 +138,14 @@ Fixposition 默认连接 `tcpcli://192.168.1.103:21000`。RSLidar 默认型号�
 全局图默认位于 `odom`，分辨率为 0.04 m。它不是一张不断扩大的稠密 NumPy
 数组，而是逻辑无边界的稀疏瓦片库：
 
-- 每次点云成功融合后立即把局部后验更新到全局瓦片；
+- 每次点云成功融合后，只把该帧真正更新的局部单元送入全局瓦片；
+- 全局每格保存 `elevation`、`variance`、`observation_count` 和
+  `last_update_revision`，使用方差加权更新，不再用新高度直接覆盖历史值；
+- 新旧高度差门限取 3σ 和 0.30 m 中较小值，超过即拒绝写入；方差下限默认是
+  0.0025 m²，避免重复相关观测产生虚假高置信度；
 - 每块为 `128 × 128` 格，即 `5.12 × 5.12 m`；
 - 只创建真正观测到的块，车辆远距离跳转不会分配中间空白区域；
-- 内存最多缓存 256 块，单 elevation 层原始数据约 16 MiB；
+- 内存最多缓存 256 块，四层瓦片原始数据约 64 MiB；
 - 冷瓦片由后台线程压缩写入
   `~/.ros/elevation_mapping_cupy/global_tiles.sqlite3`，因此路线长度受磁盘容量而非
   固定地图边界限制。
@@ -165,7 +169,8 @@ ros2 param set /elevation_mapping_node global_map_view_center_y -15.0
 
 `global_map_resume_from_disk` 默认是 `false`：每次启动建立一个新会话，避免
 `odom` 重置后把两次路线错误拼接。只有确认 `odom/map` 的原点跨重启完全一致时，
-才可改为 `true` 续建旧数据库。磁盘终究是有限的，应定期检查：
+才可改为 `true` 续建旧数据库。概率全局图使用 schema v2，旧版仅 elevation 的
+schema v1 数据库不能续建，需要另存或删除后重新建图。磁盘终究是有限的，应定期检查：
 
 ```bash
 du -h ~/.ros/elevation_mapping_cupy/global_tiles.sqlite3*

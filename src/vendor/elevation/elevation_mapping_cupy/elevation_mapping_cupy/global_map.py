@@ -1,10 +1,10 @@
 """Sparse, tiled, disk-backed global elevation-map storage.
 
-The CUDA mapper intentionally remains a small rolling window. Every fused
-point-cloud posterior is copied into fixed-size CPU tiles keyed by integer map
-coordinates. Only observed tiles exist, so a long narrow route does not
-allocate the empty rectangle around it. A bounded LRU cache keeps hot tiles in
-RAM while a background SQLite writer persists cold tiles.
+The CUDA mapper intentionally remains a small rolling window. Cells updated by
+each point cloud are fused, with their variance, into fixed-size CPU tiles
+keyed by integer map coordinates. Only observed tiles exist, so a long narrow
+route does not allocate the empty rectangle around it. A bounded LRU cache
+keeps hot tiles in RAM while a background SQLite writer persists cold tiles.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ class GlobalMapFuseResult:
     valid_input_cells: int
     written_cells: int
     touched_tiles: int
+    rejected_cells: int = 0
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,9 @@ class GlobalMapWindow:
     """Finite dense view extracted from the unbounded tiled map."""
 
     elevation_yx: np.ndarray
+    variance_yx: np.ndarray
+    observation_count_yx: np.ndarray
+    last_update_revision_yx: np.ndarray
     resolution: float
     center_x: float
     center_y: float
@@ -60,6 +64,19 @@ class GlobalMapWindow:
         return np.ascontiguousarray(
             np.flip(self.elevation_yx.T, axis=(0, 1))
         )
+
+    def layer_grid_map_copy(self, layer: str) -> np.ndarray:
+        """Convert a named natural-layout global layer to GridMap layout."""
+
+        arrays = {
+            "elevation": self.elevation_yx,
+            "variance": self.variance_yx,
+            "observation_count": self.observation_count_yx,
+            "last_update_revision": self.last_update_revision_yx,
+        }
+        if layer not in arrays:
+            raise KeyError(f"Unknown global-map layer: {layer}")
+        return np.ascontiguousarray(np.flip(arrays[layer].T, axis=(0, 1)))
 
 
 @dataclass
@@ -121,7 +138,9 @@ def downsample_elevation_blocks(
 class _SqliteTileBackend:
     """SQLite persistence with compression on a dedicated writer thread."""
 
-    _SCHEMA_VERSION = 1
+    # Version 2 stores four float32 layers per tile: elevation, variance,
+    # accepted observation count, and last-update revision.
+    _SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -478,6 +497,11 @@ class GlobalMapAccumulator:
     # repeated shifts. Keep enough margin for that numerical error while still
     # rejecting a real sub-cell geometry mismatch.
     _CENTER_SNAP_TOLERANCE_CELLS = 0.05
+    _ELEVATION = 0
+    _VARIANCE = 1
+    _OBSERVATION_COUNT = 2
+    _LAST_UPDATE_REVISION = 3
+    _LAYER_COUNT = 4
 
     def __init__(
         self,
@@ -488,6 +512,10 @@ class GlobalMapAccumulator:
         storage_path: str = "",
         resume_from_disk: bool = False,
         map_frame: str = "map",
+        variance_floor: float = 0.0025,
+        variance_ceiling: float = 4.0,
+        outlier_sigma: float = 3.0,
+        max_height_jump: float = 0.30,
     ) -> None:
         if not math.isfinite(resolution) or resolution <= 0.0:
             raise ValueError("Global-map resolution must be finite and positive.")
@@ -497,12 +525,34 @@ class GlobalMapAccumulator:
             raise ValueError("global_map_max_tiles_in_memory must be a positive integer.")
         if not map_frame:
             raise ValueError("Global-map frame must be non-empty.")
+        if not math.isfinite(variance_floor) or variance_floor <= 0.0:
+            raise ValueError("Global-map variance floor must be finite and positive.")
+        if (
+            not math.isfinite(variance_ceiling)
+            or variance_ceiling < variance_floor
+        ):
+            raise ValueError(
+                "Global-map variance ceiling must be finite and no smaller than the floor."
+            )
+        if not math.isfinite(outlier_sigma) or outlier_sigma <= 0.0:
+            raise ValueError("Global-map outlier sigma must be finite and positive.")
+        if not math.isfinite(max_height_jump) or max_height_jump <= 0.0:
+            raise ValueError("Global-map maximum height jump must be finite and positive.")
 
         self.resolution = float(resolution)
         self.tile_size_cells = int(tile_size_cells)
         self.max_tiles_in_memory = int(max_tiles_in_memory)
         self.map_frame = str(map_frame)
-        self._tile_shape = (self.tile_size_cells, self.tile_size_cells)
+        self.variance_floor = float(variance_floor)
+        self.variance_ceiling = float(variance_ceiling)
+        self.outlier_sigma = float(outlier_sigma)
+        self.max_height_jump = float(max_height_jump)
+        self._spatial_tile_shape = (self.tile_size_cells, self.tile_size_cells)
+        self._tile_shape = (
+            self._LAYER_COUNT,
+            self.tile_size_cells,
+            self.tile_size_cells,
+        )
         # Serializes public operations with clear/close. The SQLite callback
         # intentionally uses only _lock, so waiting for the writer cannot
         # deadlock on this lifecycle lock.
@@ -664,26 +714,60 @@ class GlobalMapAccumulator:
         self,
         center_xy: Sequence[float],
         elevation_yx: np.ndarray,
+        variance_yx: Optional[np.ndarray] = None,
+        updated_yx: Optional[np.ndarray] = None,
     ) -> GlobalMapFuseResult:
-        """Write one fused local posterior directly into sparse global tiles."""
+        """Fuse newly observed local cells into probabilistic global tiles."""
 
         with self._operation_lock:
             self._ensure_open()
-            return self._fuse_snapshot(center_xy, elevation_yx)
+            return self._fuse_snapshot(
+                center_xy, elevation_yx, variance_yx, updated_yx
+            )
 
     def _fuse_snapshot(
         self,
         center_xy: Sequence[float],
         elevation_yx: np.ndarray,
+        variance_yx: Optional[np.ndarray],
+        updated_yx: Optional[np.ndarray],
     ) -> GlobalMapFuseResult:
 
         local = np.asarray(elevation_yx, dtype=np.float32)
         if local.ndim != 2:
             raise ValueError(f"Local elevation must be 2-D, got {local.shape}.")
+        if variance_yx is None:
+            variance = np.ones(local.shape, dtype=np.float32)
+        else:
+            variance = np.asarray(variance_yx, dtype=np.float32)
+            if variance.shape != local.shape:
+                raise ValueError(
+                    "Local variance shape must match elevation: "
+                    f"{variance.shape} vs {local.shape}."
+                )
+        if updated_yx is None:
+            updated = np.ones(local.shape, dtype=bool)
+        else:
+            updated = np.asarray(updated_yx, dtype=bool)
+            if updated.shape != local.shape:
+                raise ValueError(
+                    "Local update-mask shape must match elevation: "
+                    f"{updated.shape} vs {local.shape}."
+                )
         start_ix, start_iy = self._validate_snapshot_geometry(center_xy, local.shape)
-        valid_input_cells = int(np.isfinite(local).sum())
+        valid_input = (
+            updated
+            & np.isfinite(local)
+            & np.isfinite(variance)
+            & (variance > 0.0)
+        )
+        valid_input_cells = int(valid_input.sum())
         if valid_input_cells == 0:
             return GlobalMapFuseResult(0, 0, 0)
+
+        variance = np.clip(
+            variance, self.variance_floor, self.variance_ceiling
+        )
 
         cells_y, cells_x = local.shape
         end_ix = start_ix + cells_x
@@ -693,6 +777,7 @@ class GlobalMapAccumulator:
         min_ty = start_iy // self.tile_size_cells
         max_ty = (end_iy - 1) // self.tile_size_cells
         written_cells = 0
+        rejected_cells = 0
         touched: List[TileKey] = []
 
         with self._lock:
@@ -713,11 +798,18 @@ class GlobalMapAccumulator:
                     source_x0 = overlap_ix0 - start_ix
                     dest_x0 = overlap_ix0 - tile_ix0
                     width = overlap_ix1 - overlap_ix0
-                    source = local[
+                    source_height = local[
                         source_y0 : source_y0 + height,
                         source_x0 : source_x0 + width,
                     ]
-                    valid = np.isfinite(source)
+                    source_variance = variance[
+                        source_y0 : source_y0 + height,
+                        source_x0 : source_x0 + width,
+                    ]
+                    valid = valid_input[
+                        source_y0 : source_y0 + height,
+                        source_x0 : source_x0 + width,
+                    ]
                     count = int(valid.sum())
                     if count == 0:
                         continue
@@ -725,17 +817,68 @@ class GlobalMapAccumulator:
                     key = (tile_x, tile_y)
                     entry = self._get_tile_locked(key, create=True)
                     destination = entry.data[
+                        :,
                         dest_y0 : dest_y0 + height,
                         dest_x0 : dest_x0 + width,
                     ]
-                    destination[valid] = source[valid]
+                    destination_height = destination[self._ELEVATION]
+                    destination_variance = destination[self._VARIANCE]
+                    destination_count = destination[self._OBSERVATION_COUNT]
+                    destination_revision = destination[self._LAST_UPDATE_REVISION]
+
+                    unseen = valid & (
+                        ~np.isfinite(destination_height)
+                        | ~np.isfinite(destination_variance)
+                        | (destination_count <= 0.0)
+                    )
+                    destination_height[unseen] = source_height[unseen]
+                    destination_variance[unseen] = source_variance[unseen]
+                    destination_count[unseen] = 1.0
+                    destination_revision[unseen] = float(revision)
+
+                    existing = valid & ~unseen
+                    innovation = source_height - destination_height
+                    combined_variance = destination_variance + source_variance
+                    statistical_limit = self.outlier_sigma * np.sqrt(
+                        np.maximum(combined_variance, self.variance_floor)
+                    )
+                    accepted_existing = existing & (
+                        np.abs(innovation)
+                        <= np.minimum(statistical_limit, self.max_height_jump)
+                    )
+                    if accepted_existing.any():
+                        gain = np.zeros_like(source_height, dtype=np.float32)
+                        denominator = combined_variance[accepted_existing]
+                        gain[accepted_existing] = (
+                            destination_variance[accepted_existing] / denominator
+                        )
+                        destination_height[accepted_existing] += (
+                            gain[accepted_existing] * innovation[accepted_existing]
+                        )
+                        destination_variance[accepted_existing] = np.maximum(
+                            self.variance_floor,
+                            (1.0 - gain[accepted_existing])
+                            * destination_variance[accepted_existing],
+                        )
+                        destination_count[accepted_existing] = np.minimum(
+                            destination_count[accepted_existing] + 1.0,
+                            np.float32(16_777_216.0),
+                        )
+                        destination_revision[accepted_existing] = float(revision)
+
+                    rejected = existing & ~accepted_existing
+                    accepted = unseen | accepted_existing
+                    accepted_count = int(accepted.sum())
+                    rejected_cells += int(rejected.sum())
+                    if accepted_count == 0:
+                        continue
                     entry.revision = revision
                     self._tiles.move_to_end(key)
                     self._mark_visualization_dirty_locked(key)
                     touched.append(key)
-                    written_cells += count
+                    written_cells += accepted_count
 
-                    valid_y, valid_x = np.nonzero(valid)
+                    valid_y, valid_x = np.nonzero(accepted)
                     self._extend_bounds_locked(
                         overlap_ix0 + int(valid_x.min()),
                         overlap_ix0 + int(valid_x.max()),
@@ -748,6 +891,7 @@ class GlobalMapAccumulator:
             valid_input_cells=valid_input_cells,
             written_cells=written_cells,
             touched_tiles=len(set(touched)),
+            rejected_cells=rejected_cells,
         )
 
     def extract_window(
@@ -793,7 +937,13 @@ class GlobalMapAccumulator:
             center_iy = int(round(center[1] / self.resolution))
             start_ix = center_ix - cells_x // 2
             start_iy = center_iy - cells_y // 2
-            output = np.full((cells_y, cells_x), np.nan, dtype=np.float32)
+            output = np.full(
+                (self._LAYER_COUNT, cells_y, cells_x),
+                np.nan,
+                dtype=np.float32,
+            )
+            output[self._OBSERVATION_COUNT].fill(0.0)
+            output[self._LAST_UPDATE_REVISION].fill(0.0)
             end_ix = start_ix + cells_x
             end_iy = start_iy + cells_y
             min_tx = start_ix // self.tile_size_cells
@@ -820,9 +970,11 @@ class GlobalMapAccumulator:
                     height = overlap_iy1 - overlap_iy0
                     width = overlap_ix1 - overlap_ix0
                     output[
+                        :,
                         dest_y0 : dest_y0 + height,
                         dest_x0 : dest_x0 + width,
                     ] = entry.data[
+                        :,
                         source_y0 : source_y0 + height,
                         source_x0 : source_x0 + width,
                     ]
@@ -836,7 +988,10 @@ class GlobalMapAccumulator:
                 start_iy + self._phase_y - 0.5 + 0.5 * cells_y
             ) * self.resolution
             return GlobalMapWindow(
-                elevation_yx=output,
+                elevation_yx=output[self._ELEVATION],
+                variance_yx=output[self._VARIANCE],
+                observation_count_yx=output[self._OBSERVATION_COUNT],
+                last_update_revision_yx=output[self._LAST_UPDATE_REVISION],
                 resolution=self.resolution,
                 center_x=float(actual_center_x),
                 center_y=float(actual_center_y),
@@ -884,7 +1039,9 @@ class GlobalMapAccumulator:
                     key, _ = self._visualization_dirty.popitem(last=False)
                     entry = self._get_tile_locked(key, create=False)
                     if entry is not None:
-                        result.append((key, entry.data.copy()))
+                        result.append(
+                            (key, entry.data[self._ELEVATION].copy())
+                        )
                     self._evict_if_needed_locked()
             return result
 
@@ -975,11 +1132,10 @@ class GlobalMapAccumulator:
                 revision, data = loaded
                 entry = _TileEntry(data, revision, revision)
             elif create:
-                entry = _TileEntry(
-                    np.full(self._tile_shape, np.nan, dtype=np.float32),
-                    0,
-                    0,
-                )
+                data = np.full(self._tile_shape, np.nan, dtype=np.float32)
+                data[self._OBSERVATION_COUNT].fill(0.0)
+                data[self._LAST_UPDATE_REVISION].fill(0.0)
+                entry = _TileEntry(data, 0, 0)
             else:
                 return None
         self._tiles[key] = entry
@@ -1040,6 +1196,16 @@ class GlobalMapAccumulator:
             "resolution": self.resolution,
             "tile_size_cells": self.tile_size_cells,
             "map_frame": self.map_frame,
+            "global_layers": [
+                "elevation",
+                "variance",
+                "observation_count",
+                "last_update_revision",
+            ],
+            "variance_floor": self.variance_floor,
+            "variance_ceiling": self.variance_ceiling,
+            "outlier_sigma": self.outlier_sigma,
+            "max_height_jump": self.max_height_jump,
             "phase_x": self._phase_x,
             "phase_y": self._phase_y,
             "min_ix": self._min_ix,
@@ -1052,6 +1218,21 @@ class GlobalMapAccumulator:
     def _load_state_metadata(self, metadata: Dict[str, object]) -> None:
         if not metadata:
             return
+        expected_fusion = {
+            "variance_floor": self.variance_floor,
+            "variance_ceiling": self.variance_ceiling,
+            "outlier_sigma": self.outlier_sigma,
+            "max_height_jump": self.max_height_jump,
+        }
+        for name, expected in expected_fusion.items():
+            actual = metadata.get(name)
+            if actual is None or not math.isclose(
+                float(actual), expected, rel_tol=0.0, abs_tol=1.0e-9
+            ):
+                raise ValueError(
+                    f"Global tile database metadata mismatch for '{name}': "
+                    f"database={actual!r}, requested={expected!r}."
+                )
         phase_x = metadata.get("phase_x")
         phase_y = metadata.get("phase_y")
         for name, phase in (("phase_x", phase_x), ("phase_y", phase_y)):
