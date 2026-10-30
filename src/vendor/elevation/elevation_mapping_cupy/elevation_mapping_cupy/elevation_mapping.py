@@ -89,6 +89,9 @@ class ElevationSnapshotBuffer:
     variance_pinned_memory: Any
     updated_pinned_memory: Any
     center_pinned_memory: Any
+    clearance_gpu: Any
+    clearance_cpu: np.ndarray
+    clearance_pinned_memory: Any
     stamp: Any = None
     generation: int = 0
 
@@ -139,6 +142,11 @@ class ElevationMap:
         self.global_update_mask = xp.zeros(
             (self.cell_n, self.cell_n), dtype=xp.bool_
         )
+        # World-Z upper bounds from real rays through cells, not from map
+        # shifting, variance expiry or interpolation. Inf means no evidence.
+        self.global_clearance_bound = xp.full(
+            (self.cell_n, self.cell_n), xp.inf, dtype=self.data_type
+        )
         self.layer_names = [
             "elevation",
             "variance",
@@ -166,12 +174,6 @@ class ElevationMap:
         # Initial mean_error
         self.mean_error = 0.0
         self.additive_mean_error = 0.0
-        self.drift_inlier_count = 0
-        self.drift_mean_error = math.nan
-        self.drift_applied_correction = 0.0
-        self.drift_cumulative_correction = 0.0
-        self.drift_motion_gate_open = False
-        self.drift_applied = False
 
         self.compile_kernels()
 
@@ -201,18 +203,13 @@ class ElevationMap:
         with self.map_lock:
             self.elevation_map *= 0.0
             self.global_update_mask.fill(False)
+            self.global_clearance_bound.fill(cp.inf)
             # Initial variance
             self.elevation_map[1] += self.initial_variance
             self.plugin_manager.reset_layers()
 
         self.mean_error = 0.0
         self.additive_mean_error = 0.0
-        self.drift_inlier_count = 0
-        self.drift_mean_error = math.nan
-        self.drift_applied_correction = 0.0
-        self.drift_cumulative_correction = 0.0
-        self.drift_motion_gate_open = False
-        self.drift_applied = False
 
     def get_center_position(self, position):
         """Return the position of the map center.
@@ -308,16 +305,23 @@ class ElevationMap:
             self.global_update_mask = cp.roll(
                 self.global_update_mask, shift_value, axis=(0, 1)
             )
+            self.global_clearance_bound = cp.roll(
+                self.global_clearance_bound, shift_value, axis=(0, 1)
+            )
             self.pad_value(self.elevation_map, shift_value, value=0.0)
             self.pad_value(self.elevation_map, shift_value, idx=1, value=self.initial_variance)
             if shift_value[0] > 0:
                 self.global_update_mask[: shift_value[0], :] = False
+                self.global_clearance_bound[: shift_value[0], :] = cp.inf
             elif shift_value[0] < 0:
                 self.global_update_mask[shift_value[0] :, :] = False
+                self.global_clearance_bound[shift_value[0] :, :] = cp.inf
             if shift_value[1] > 0:
                 self.global_update_mask[:, : shift_value[1]] = False
+                self.global_clearance_bound[:, : shift_value[1]] = cp.inf
             elif shift_value[1] < 0:
                 self.global_update_mask[:, shift_value[1] :] = False
+                self.global_clearance_bound[:, shift_value[1] :] = cp.inf
             # Plugin layers are computed on-demand; invalidate cache when shifting.
             self.plugin_manager.reset_layers()
 
@@ -346,6 +350,9 @@ class ElevationMap:
         self.visibility_map = cp.empty(
             (3, self.cell_n, self.cell_n),
             dtype=self.data_type,
+        )
+        self.ray_clearance_map = cp.full(
+            (self.cell_n, self.cell_n), cp.inf, dtype=self.data_type
         )
         self.traversability_input = cp.zeros((self.cell_n, self.cell_n), dtype=self.data_type)
         self.traversability_mask_dummy = cp.zeros((self.cell_n, self.cell_n), dtype=self.data_type)
@@ -409,7 +416,8 @@ class ElevationMap:
         """
         t -= self.center
 
-    def update_map_with_kernel(self, points_all, channels, R, t, position_noise, orientation_noise):
+    def update_map_with_kernel(self, points_all, channels, R, t, position_noise, orientation_noise,
+                               ray_origin=None):
         """Update map with new measurement.
 
         Args:
@@ -429,8 +437,11 @@ class ElevationMap:
             self.map_snapshot[...] = self.elevation_map
             self.visibility_map.fill(0.0)
             self.visibility_map[2].fill(cp.inf)
+            self.ray_clearance_map.fill(cp.inf)
             t = t.copy()
+            sensor_origin = t.copy() if ray_origin is None else cp.asarray(ray_origin, dtype=t.dtype).copy()
             t[2] -= self.center[2]
+            sensor_origin[2] -= self.center[2]
             self.error_counting_kernel(
                 self.map_snapshot,
                 points,
@@ -443,40 +454,31 @@ class ElevationMap:
                 self.error_cnt,
                 size=(points.shape[0]),
             )
-            self.drift_inlier_count = int(self.error_cnt[0].item())
-            self.drift_mean_error = math.nan
-            self.drift_applied_correction = 0.0
-            self.drift_motion_gate_open = bool(
-                position_noise > self.param.position_noise_thresh
-                or orientation_noise > self.param.orientation_noise_thresh
-            )
-            self.drift_applied = False
             if (
                 self.param.enable_drift_compensation
-                and self.drift_inlier_count > self.param.min_height_drift_cnt
-                and self.drift_motion_gate_open
-            ):
-                self.mean_error = float(
-                    (self.error[0] / self.error_cnt[0]).item()
+                and self.error_cnt > self.param.min_height_drift_cnt
+                and (
+                    position_noise > self.param.position_noise_thresh
+                    or orientation_noise > self.param.orientation_noise_thresh
                 )
-                self.drift_mean_error = self.mean_error
+            ):
+                self.mean_error = self.error / self.error_cnt
                 self.additive_mean_error += self.mean_error
-                if abs(self.mean_error) < self.param.max_drift:
+                if np.abs(self.mean_error) < self.param.max_drift:
                     correction = self.mean_error * self.param.drift_compensation_alpha
                     self.map_snapshot[0] += correction
-                    self.drift_applied_correction = float(correction)
-                    self.drift_cumulative_correction += float(correction)
-                    self.drift_applied = True
             self.add_points_kernel(
                 self.center[:1],
                 self.center[1:2],
                 R,
                 t,
+                sensor_origin,
                 self.map_snapshot,
                 self.normal_map,
                 points,
                 self.new_map,
                 self.visibility_map,
+                self.ray_clearance_map,
                 size=(points.shape[0]),
             )
 
@@ -488,6 +490,7 @@ class ElevationMap:
                 size=(self.cell_n * self.cell_n),
             )
             self.global_update_mask |= self.new_map[2] > 0.0
+            self._accumulate_global_clearance()
 
             if self.param.enable_overlap_clearance:
                 self.clear_overlap_map(t)
@@ -512,20 +515,20 @@ class ElevationMap:
                 self.elevation_map[3][3:-3, 3:-3] = traversability.reshape(
                     (traversability.shape[2], traversability.shape[3])
                 )
-            else:
-                # The drift estimator still uses layer 3 as a confidence gate.
-                # Keep it neutral for valid cells when the mapper's legacy
-                # traversability network is disabled; otherwise newly shifted-in
-                # cells stay at zero and Z compensation dies after one map length.
-                self.elevation_map[3] = cp.where(
-                    self.elevation_map[2] > 0.5,
-                    1.0,
-                    0.0,
-                )
             self.plugin_manager.reset_layers()
 
         if self.param.enable_normal_estimation:
             self.update_normal(self.traversability_input)
+
+    def _accumulate_global_clearance(self):
+        """Keep actual ray evidence, with current endpoints taking priority."""
+        endpoint = (self.new_map[2] > 0.0) | (self.new_map[5] > 0.0)
+        # Global evidence is geometric. Local normal/recent-update heuristics
+        # must not hide a real ray passing through a departed object's cell.
+        ray_bound = self.ray_clearance_map + self.center[2]
+        self.global_clearance_bound[...] = cp.where(
+            endpoint, cp.inf, cp.minimum(self.global_clearance_bound, ray_bound)
+        )
 
     def clear_overlap_map(self, t):
         """Clear overlapping areas around the map center.
@@ -554,21 +557,6 @@ class ElevationMap:
         """
         return self.additive_mean_error
 
-    def get_drift_compensation_status(self):
-        """Return the latest Z-drift decision without exposing GPU arrays."""
-        with self.map_lock:
-            return {
-                "enabled": bool(self.param.enable_drift_compensation),
-                "motion_gate_open": bool(self.drift_motion_gate_open),
-                "inlier_count": int(self.drift_inlier_count),
-                "mean_error_m": float(self.drift_mean_error),
-                "applied_correction_m": float(self.drift_applied_correction),
-                "cumulative_correction_m": float(
-                    self.drift_cumulative_correction
-                ),
-                "applied": bool(self.drift_applied),
-            }
-
     def update_variance(self):
         """Adds the time variacne to the valid cells."""
         self.elevation_map[1] += self.param.time_variance * self.elevation_map[2]
@@ -591,6 +579,7 @@ class ElevationMap:
         t: cp._core.core.ndarray,
         position_noise: float,
         orientation_noise: float,
+        *, ray_origin=None,
     ):
         """Input the point cloud and fuse the new measurements to update the elevation map.
 
@@ -614,6 +603,7 @@ class ElevationMap:
             cp.asarray(t, dtype=self.data_type),
             position_noise,
             orientation_noise,
+            ray_origin=ray_origin,
         )
 
     def input_image(
@@ -866,13 +856,15 @@ class ElevationMap:
         elevation_data=None,
         variance_data=None,
         updated_data=None,
+        *, include_clearance=False,
     ):
         """Copy newly updated rolling cells for probabilistic global fusion.
 
         Unlike :meth:`export_elevation_snapshot`, this exports variance and an
         accumulated update mask, then atomically consumes that mask.  Cells
         merely carried in the rolling posterior are not presented as new,
-        independent global observations.
+        independent global observations. With include_clearance, a fifth array
+        carries world-Z free-space upper bounds from real rays (Inf otherwise).
         """
 
         shape = (self.cell_n - 2, self.cell_n - 2)
@@ -910,8 +902,14 @@ class ElevationMap:
             self.copy_to_cpu(variance, variance_data)
             self.copy_to_cpu(updated.astype(cp.uint8), updated_data)
             center = cp.asnumpy(self.center).astype(np.float64, copy=False)
+            clearance = (
+                cp.asnumpy(self.global_clearance_bound[1:-1, 1:-1])
+                if include_clearance else None
+            )
             self.global_update_mask.fill(False)
-        return center, elevation_data, variance_data, updated_data
+            self.global_clearance_bound.fill(cp.inf)
+        result = (center, elevation_data, variance_data, updated_data)
+        return result + (clearance,) if include_clearance else result
 
     def create_elevation_snapshot_buffer(self) -> ElevationSnapshotBuffer:
         """Allocate one reusable device snapshot and pinned host destination."""
@@ -925,6 +923,7 @@ class ElevationMap:
         variance_memory = cp.cuda.alloc_pinned_memory(variance_bytes)
         updated_memory = cp.cuda.alloc_pinned_memory(updated_bytes)
         center_memory = cp.cuda.alloc_pinned_memory(center_bytes)
+        clearance_memory = cp.cuda.alloc_pinned_memory(elevation_bytes)
         elevation_cpu = np.frombuffer(
             elevation_memory, dtype=np.float32, count=int(np.prod(shape))
         ).reshape(shape)
@@ -949,6 +948,10 @@ class ElevationMap:
             variance_pinned_memory=variance_memory,
             updated_pinned_memory=updated_memory,
             center_pinned_memory=center_memory,
+            clearance_gpu=cp.empty(shape, dtype=cp.float32),
+            clearance_cpu=np.frombuffer(clearance_memory, dtype=np.float32,
+                                        count=int(np.prod(shape))).reshape(shape),
+            clearance_pinned_memory=clearance_memory,
         )
 
     @staticmethod
@@ -983,7 +986,9 @@ class ElevationMap:
             )
             buffer.updated_gpu[...] = updated
             buffer.center_gpu[...] = self.center
+            buffer.clearance_gpu[...] = self.global_clearance_bound[1:-1, 1:-1]
             self.global_update_mask.fill(False)
+            self.global_clearance_bound.fill(cp.inf)
             # All map updates and this device copy use the current stream. The
             # event lets a separate copy stream wait only for this snapshot,
             # not for point-cloud kernels submitted afterwards.
@@ -993,7 +998,8 @@ class ElevationMap:
     def materialize_elevation_snapshot(
         buffer: ElevationSnapshotBuffer,
         stream,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        *, include_clearance=False,
+    ) -> Tuple[np.ndarray, ...]:
         """Asynchronously download one captured snapshot, then wait in worker."""
 
         with stream:
@@ -1022,13 +1028,17 @@ class ElevationMap:
                 out=buffer.center_cpu,
                 blocking=False,
             )
+            if include_clearance:
+                cp.asnumpy(buffer.clearance_gpu, stream=stream,
+                           out=buffer.clearance_cpu, blocking=False)
         stream.synchronize()
-        return (
+        result = (
             buffer.center_cpu,
             buffer.elevation_cpu,
             buffer.variance_cpu,
             buffer.updated_cpu,
         )
+        return result + (buffer.clearance_cpu,) if include_clearance else result
 
     def trim_memory_pool(self):
         """Release cached CuPy allocator blocks that are not currently in use."""

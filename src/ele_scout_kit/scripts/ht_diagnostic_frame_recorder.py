@@ -13,12 +13,17 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import BoundaryNorm, ListedColormap
 import numpy as np
 from PIL import Image
 import rclpy
 from grid_map_msgs.msg import GridMap
+from nav_msgs.msg import Odometry
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformException, TransformListener
 
 from ht_traversability_ros2.core import nearest_fill_nan
 from ht_traversability_ros2.gridmap_codec import decode_layer
@@ -26,6 +31,8 @@ from ht_traversability_ros2.gridmap_codec import decode_layer
 
 LOCAL_TOPIC = "/elevation_mapping_node/elevation_map_global_local"
 HT_TOPIC = "/ht_traversability/global_local"
+ODOM_TOPIC = "/fixposition/odometry_enu"
+TRAVERSABILITY_THRESHOLD = 0.15
 
 
 def stamp_ns(message: GridMap) -> int:
@@ -118,9 +125,17 @@ class HtDiagnosticFrameRecorder(Node):
         self.z_p10: list[float] = []
         self.z_median: list[float] = []
         self.z_p90: list[float] = []
-        self.gradient_median: list[float] = []
-        self.gradient_p95: list[float] = []
+        self.dz_dt: list[float] = []
+        self.heading_yaw: list[float] = []
         self._finalized = False
+        self.latest_odometry: Odometry | None = None
+
+        # The bag contains the complete FP_ECEF -> FP_ENU0 -> map -> odom and
+        # FP_ECEF -> FP_POI -> base_footprint TF chains.  Looking up the
+        # composed transform here makes the plotted arrow reflect recorded TF,
+        # rather than assuming that the local crop's +x axis is vehicle-forward.
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=180.0))
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self._manifest_handle = (self.output_dir / "manifest.csv").open(
             "w", newline="", encoding="utf-8"
@@ -132,7 +147,8 @@ class HtDiagnosticFrameRecorder(Node):
                 "local_center_x_m", "local_center_y_m", "finite_z_cells",
                 "z_min_m", "z_p10_m", "z_median_m", "z_mean_m", "z_p90_m",
                 "z_max_m", "z_gradient_median", "z_gradient_mean",
-                "z_gradient_p95", "ht_valid_cells",
+                "z_gradient_p95", "z_derivative_mps", "vehicle_yaw_rad",
+                "vehicle_yaw_deg", "heading_tf", "ht_valid_cells",
                 *(f"ht_dir_{index}_median" for index in range(8)), "png_file",
             ],
         )
@@ -156,10 +172,14 @@ class HtDiagnosticFrameRecorder(Node):
         self._subscriptions = [
             self.create_subscription(GridMap, LOCAL_TOPIC, self._local, local_qos),
             self.create_subscription(GridMap, HT_TOPIC, self._ht, ht_qos),
+            self.create_subscription(Odometry, ODOM_TOPIC, self._odometry, 50),
         ]
         self.get_logger().info(
             f"Recording detailed HT diagnostic frames under {self.output_dir}"
         )
+
+    def _odometry(self, message: Odometry) -> None:
+        self.latest_odometry = message
 
     def _local(self, message: GridMap) -> None:
         self.local_count += 1
@@ -208,6 +228,11 @@ class HtDiagnosticFrameRecorder(Node):
         probability = np.stack([ht_layers[f"ht_dir_{index}"] for index in range(8)])
         valid = ht_layers["ht_valid"] > 0.5
         probability[:, ~valid] = np.nan
+        binary_cost = np.where(
+            valid[np.newaxis, :, :],
+            (probability < TRAVERSABILITY_THRESHOLD).astype(np.float32),
+            np.nan,
+        )
         resolution = float(local_message.info.resolution)
         gradient = gradient_magnitude(height, resolution)
         z_stats = finite_stats(height)
@@ -219,16 +244,58 @@ class HtDiagnosticFrameRecorder(Node):
         self.z_p10.append(z_stats[2])
         self.z_median.append(z_stats[3])
         self.z_p90.append(z_stats[5])
-        self.gradient_median.append(gradient_stats[3])
         finite_gradient = gradient[np.isfinite(gradient)]
-        self.gradient_p95.append(
+        gradient_p95 = (
             float(np.percentile(finite_gradient, 95)) if finite_gradient.size else float("nan")
         )
+        if len(self.times) < 2 or not np.isfinite(self.z_median[-1]):
+            dz_dt = float("nan")
+        else:
+            dt = self.times[-1] - self.times[-2]
+            previous = self.z_median[-2]
+            dz_dt = (
+                (self.z_median[-1] - previous) / dt
+                if dt > 0.0 and np.isfinite(previous) else float("nan")
+            )
+        self.dz_dt.append(dz_dt)
+
+        heading_tf = "odom<-base_footprint"
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "odom", "base_footprint", Time(), timeout=Duration(seconds=0.0)
+            )
+            q = transform.transform.rotation
+            yaw = float(np.arctan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+            ))
+        except TransformException as exc:
+            # Stable replay publishes this odometry from the same recorded
+            # Fixposition pose as FP_ECEF -> FP_POI.  Its ENU quaternion is the
+            # composed TF orientation and remains available even when the
+            # recorder's TF callbacks trail the expensive plotting callback.
+            if self.latest_odometry is not None:
+                q = self.latest_odometry.pose.pose.orientation
+                yaw = float(np.arctan2(
+                    2.0 * (q.w * q.z + q.x * q.y),
+                    1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+                ))
+                heading_tf = "FP_ENU0<-FP_POI (recorded odometry fallback)"
+            else:
+                yaw = float("nan")
+                heading_tf = f"unavailable: {exc}"
+                self.get_logger().warning(
+                    f"TF heading unavailable for stamp {key}: {exc}",
+                    throttle_duration_sec=2.0,
+                )
+        self.heading_yaw.append(yaw)
 
         half_x = float(local_message.info.length_x) / 2.0
         half_y = float(local_message.info.length_y) / 2.0
         plot_extent = (-half_x, half_x, -half_y, half_y)
-        probability_cmap = masked_cmap("RdYlGn")
+        probability_cmap = ListedColormap(["#1a9641", "#d7191c"])
+        probability_cmap.set_bad("black")
+        probability_norm = BoundaryNorm([-0.5, 0.5, 1.5], probability_cmap.N)
         height_cmap = masked_cmap("terrain")
         gradient_cmap = masked_cmap("magma")
         figure = plt.figure(figsize=(18, 10.7), constrained_layout=True)
@@ -236,16 +303,26 @@ class HtDiagnosticFrameRecorder(Node):
         direction_axes = [figure.add_subplot(grid[row, column]) for row in range(2) for column in range(4)]
         for index, axis in enumerate(direction_axes):
             image = axis.imshow(
-                np.ma.masked_invalid(probability[index]), origin="lower",
-                extent=plot_extent, cmap=probability_cmap, vmin=0.0, vmax=1.0,
+                np.ma.masked_invalid(binary_cost[index]), origin="lower",
+                extent=plot_extent, cmap=probability_cmap, norm=probability_norm,
             )
-            axis.set_title(f"HT dir {index}")
+            axis.set_title(f"HT cost dir {index} binary (threshold {TRAVERSABILITY_THRESHOLD:.2f})")
             axis.set_xlabel("x [m]")
             axis.set_ylabel("y [m]")
             axis.set_aspect("equal")
+            if np.isfinite(yaw):
+                arrow_length = 0.22 * min(2.0 * half_x, 2.0 * half_y)
+                axis.arrow(
+                    0.0, 0.0, arrow_length * np.cos(yaw), arrow_length * np.sin(yaw),
+                    width=0.025, head_width=0.22, head_length=0.28,
+                    facecolor="deepskyblue", edgecolor="black", length_includes_head=True,
+                    zorder=5,
+                )
+                axis.text(0.0, 0.0, " vehicle", color="white", fontsize=7,
+                          ha="left", va="bottom", zorder=6)
         figure.colorbar(
             image, ax=direction_axes, fraction=0.012, pad=0.012,
-            label="traversability probability",
+            ticks=[0, 1], label="0 = free, 1 = blocked",
         )
 
         elevation_axis = figure.add_subplot(grid[2, 0])
@@ -281,21 +358,22 @@ class HtDiagnosticFrameRecorder(Node):
         z_axis.legend(loc="upper right", fontsize=8)
 
         gradient_time_axis = figure.add_subplot(grid[2, 3])
-        gradient_time_axis.plot(self.times, self.gradient_median, color="tab:green", label="median")
-        gradient_time_axis.plot(self.times, self.gradient_p95, color="tab:orange", label="p95")
-        gradient_time_axis.scatter([relative_time], [self.gradient_median[-1]], color="tab:red", s=30, zorder=3)
-        gradient_time_axis.set_title("|grad z| over time")
+        gradient_time_axis.plot(self.times, self.dz_dt, color="tab:purple", label="d(median z)/dt")
+        gradient_time_axis.axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
+        gradient_time_axis.scatter([relative_time], [self.dz_dt[-1]], color="tab:red", s=30, zorder=3)
+        gradient_time_axis.set_title("z derivative over time")
         gradient_time_axis.set_xlabel("time [s]")
-        gradient_time_axis.set_ylabel("m/m")
+        gradient_time_axis.set_ylabel("dz/dt [m/s]")
         gradient_time_axis.grid(True, alpha=0.3)
         gradient_time_axis.legend(loc="upper right", fontsize=8)
 
         center_x = float(local_message.info.pose.position.x)
         center_y = float(local_message.info.pose.position.y)
         figure.suptitle(
-            "HT eight-direction traversability | "
+            "HT eight-direction BINARY costmap | "
             f"frame {self.saved_count:06d} | t={relative_time:.2f}s | "
-            f"center=({center_x:.2f}, {center_y:.2f}) m",
+            f"center=({center_x:.2f}, {center_y:.2f}) m | "
+            f"TF yaw={np.degrees(yaw):.1f} deg",
             fontsize=16,
         )
         path = self.frames_dir / f"frame_{self.saved_count:06d}.png"
@@ -319,7 +397,11 @@ class HtDiagnosticFrameRecorder(Node):
             "z_p90_m": z_stats[5], "z_max_m": z_stats[6],
             "z_gradient_median": gradient_stats[3],
             "z_gradient_mean": gradient_stats[4],
-            "z_gradient_p95": self.gradient_p95[-1],
+            "z_gradient_p95": gradient_p95,
+            "z_derivative_mps": dz_dt,
+            "vehicle_yaw_rad": yaw,
+            "vehicle_yaw_deg": float(np.degrees(yaw)),
+            "heading_tf": heading_tf,
             "ht_valid_cells": int(valid.sum()),
             "png_file": str(path.relative_to(self.output_dir)),
         }
@@ -382,12 +464,13 @@ def main() -> None:
     )
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
         node.finalize()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

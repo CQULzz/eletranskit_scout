@@ -41,6 +41,36 @@ def nearest_fill_nan(height: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.ascontiguousarray(filled, dtype=np.float32), finite
 
 
+def prepare_observation_height(height, observation_count):
+    """Keep prior cells distinct from measurements when preparing HT context."""
+    height = np.asarray(height, dtype=np.float32)
+    count = np.asarray(observation_count, dtype=np.float32)
+    if (height.ndim != 2 or count.shape != height.shape
+            or not np.isfinite(count).all() or (count < 0).any()):
+        raise ValueError("Invalid observation_count layer")
+    observed = count > 0
+    if not np.isfinite(height[observed]).all():
+        raise ValueError("Observed elevation must be finite")
+    if observed.any():
+        filled, _ = nearest_fill_nan(np.where(observed, height, np.nan))
+    else:
+        filled = np.where(np.isfinite(height), height, 0.0).astype(np.float32)
+    return filled, observed
+
+
+def add_unobserved_prior_layers(layers, observed):
+    """Label optimistic priors without fabricating model probabilities."""
+    observed = np.asarray(observed, dtype=bool)
+    layers["ht_observed"] = observed.astype(np.float32)
+    layers["ht_prior_free"] = (~observed).astype(np.float32)
+    for k in range(8):
+        name = f"ht_cost_dir_{k}"
+        if name in layers:
+            layers[name][~observed] = 0.0
+    if "ht_traversable" in layers:
+        layers["ht_traversable"][~observed] = 1.0
+
+
 def valid_window_ratio(valid_mask: np.ndarray, window: int = RECEPTIVE_FIELD) -> np.ndarray:
     """Fraction of observed input cells in every valid convolution window."""
 
@@ -109,6 +139,36 @@ def build_output_layers(
     return layers
 
 
+def build_direction_cost_layers(
+    probabilities: np.ndarray,
+    valid_output: np.ndarray,
+    full_shape: tuple[int, int],
+    threshold: float,
+) -> dict[str, np.ndarray]:
+    """Create eight binary directional cost layers using a probability threshold.
+
+    A valid cell is 0 when its directional traversability probability is at
+    least ``threshold`` and 1 otherwise. Unsupported cells remain NaN.
+    """
+
+    probs = np.asarray(probabilities, dtype=np.float32)
+    valid = np.asarray(valid_output, dtype=bool)
+    if probs.ndim != 3 or probs.shape[0] != DIRECTION_COUNT:
+        raise ValueError(f"Expected probabilities [8,H,W], got {probs.shape}")
+    if probs.shape[1:] != valid.shape:
+        raise ValueError("Probability and validity shapes do not match")
+    if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("traversability threshold must be between 0 and 1")
+
+    costs = np.where(
+        valid[None, :, :], (probs < threshold).astype(np.float32), np.nan
+    ).astype(np.float32)
+    return {
+        f"ht_cost_dir_{index}": embed_center(costs[index], full_shape)
+        for index in range(DIRECTION_COUNT)
+    }
+
+
 def build_conservative_traversability_layer(
     probabilities: np.ndarray,
     valid_output: np.ndarray,
@@ -135,3 +195,36 @@ def build_conservative_traversability_layer(
     traversable = np.all(probs >= threshold, axis=0).astype(np.float32)
     traversable[~valid] = np.nan
     return embed_center(traversable, full_shape)
+
+
+def bounded_median_height(filled, finite, kernel=5, max_delta=.04, max_relief=.12):
+    """Suppress small local elevation jitter while retaining steps and unknown masks."""
+    if kernel == 1:
+        return filled
+    if kernel not in (3, 5) or max_delta <= 0 or max_relief <= 0:
+        raise ValueError("Invalid height denoising parameters")
+    import cv2
+    cv2.setNumThreads(1)
+    source = np.ascontiguousarray(filled, dtype=np.float32)
+    source = source.copy()
+    for _ in range(3):
+        median = cv2.medianBlur(source, kernel)
+        positive = finite & ((source-median) > .15)
+        _, labels, stats, _ = cv2.connectedComponentsWithStats(positive.astype(np.uint8), connectivity=8)
+        small = stats[:, cv2.CC_STAT_AREA] <= 8
+        small[0] = False
+        isolated_positive = positive & small[labels]
+        if not isolated_positive.any():
+            break
+        source[isolated_positive] = median[isolated_positive]
+        if not finite.all():
+            # Refill gaps from cleaned observations, not the former positive spike.
+            source[~finite] = np.nan
+            source, _ = nearest_fill_nan(source)
+    median = cv2.medianBlur(source, kernel)
+    element = np.ones((kernel, kernel), np.uint8)
+    relief = cv2.dilate(source, element) - cv2.erode(source, element)
+    change = (np.abs(source-median) <= max_delta) & (relief <= max_relief)
+    result = source.copy()
+    result[change] = median[change]
+    return result

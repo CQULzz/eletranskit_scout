@@ -87,23 +87,3 @@ def test_supported_configs_are_ros2_clean(path: Path):
                 assert sub_cfg.get("channels") or sub_cfg.get("channel_info_topic_name"), (
                     f"{path} image subscriber '{sub_name}' needs channels or channel_info_topic_name"
                 )
-
-
-def test_pointcloud_callback_passes_measured_motion_to_drift_compensation():
-    node_source = (
-        _pkg_root() / "elevation_mapping_cupy" / "elevation_mapping_node.py"
-    ).read_text(encoding="utf-8")
-
-    assert "self._drift_motion_detector.update(" in node_source
-    assert "position_motion," in node_source
-    assert "orientation_motion," in node_source
-    assert "self._map.input_pointcloud(pts, channels, R, t_np, 0, 0)" not in node_source
-
-
-def test_drift_confidence_stays_valid_without_legacy_traversability():
-    mapping_source = (
-        _pkg_root() / "elevation_mapping_cupy" / "elevation_mapping.py"
-    ).read_text(encoding="utf-8")
-
-    assert "otherwise newly shifted-in" in mapping_source
-    assert "self.elevation_map[3] = cp.where(" in mapping_source

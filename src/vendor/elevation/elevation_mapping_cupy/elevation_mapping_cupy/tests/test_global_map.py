@@ -8,6 +8,11 @@ from elevation_mapping_cupy.global_map import (
 )
 
 
+def _first_posterior(height, variance=1.0):
+    # Independent scalar precision oracle for the configured h0=0, P0=10000.
+    return (np.asarray(height, dtype=np.float64) / (1.0 + variance / 10000.0)).astype(np.float32)
+
+
 def _make_global(**overrides):
     params = {
         "resolution": 1.0,
@@ -36,11 +41,12 @@ def test_variance_weighted_fusion_and_nan_does_not_erase_history():
     second = np.array([[1.2, np.nan], [np.nan, 3.8]], dtype=np.float32)
     global_map.fuse_snapshot((0.0, 0.0), second, variance)
     window = global_map.extract_window((0.0, 0.0), 2.0, 2.0)
-    expected = np.array([[1.1, 2.0], [3.0, 3.9]], dtype=np.float32)
+    expected = np.array([[2.2 / 2.0001, 2.0 / 1.0001],
+                         [3.0 / 1.0001, 7.8 / 2.0001]], dtype=np.float32)
     assert np.allclose(window.elevation_yx, expected)
     assert np.allclose(
         window.variance_yx,
-        np.array([[0.5, 1.0], [1.0, 0.5]], dtype=np.float32),
+        np.array([[1 / 2.0001, 1 / 1.0001], [1 / 1.0001, 1 / 2.0001]], dtype=np.float32),
     )
     assert np.array_equal(
         window.observation_count_yx,
@@ -65,7 +71,7 @@ def test_only_explicitly_updated_cells_are_fused():
     assert result.written_cells == 1
     assert np.allclose(
         window.elevation_yx,
-        np.array([[1.1, 1.0], [1.0, 1.0]], dtype=np.float32),
+        np.array([[2.2 / 2.0001, 1 / 1.0001], [1 / 1.0001, 1 / 1.0001]], dtype=np.float32),
     )
 
 
@@ -83,8 +89,83 @@ def test_large_conflicting_height_is_rejected():
     assert result.rejected_cells == 4
     assert np.all(
         global_map.extract_window((0.0, 0.0), 2.0, 2.0).elevation_yx
-        == 1.0
+        == _first_posterior(1.0, variance=0.01)
     )
+
+
+@pytest.mark.parametrize('new_height', [-.75, 1.5])
+def test_consistent_real_conflicts_correct_old_height_after_ten_updates(new_height):
+    m = _make_global(conflict_confirmations=10)
+    var = np.full((2, 2), .01, np.float32)
+    m.fuse_snapshot((0, 0), np.full((2, 2), .2, np.float32), var)
+    for _ in range(9):
+        result = m.fuse_snapshot((0, 0), np.full((2, 2), new_height, np.float32), var)
+        assert result.rejected_cells == 4 and result.corrected_cells == 0
+        assert m.extract_window((0, 0), 2, 2).elevation_yx[0, 0] == pytest.approx(.2, abs=.001)
+    result = m.fuse_snapshot((0, 0), np.full((2, 2), new_height, np.float32), var)
+    assert result.corrected_cells == 4 and result.rejected_cells == 0
+    window = m.extract_window((0, 0), 2, 2)
+    assert np.allclose(window.elevation_yx, new_height)
+    assert np.allclose(window.variance_yx, .01)  # no false independent-frame certainty
+    assert (window.observation_count_yx == 2).all()
+
+
+def test_single_spike_oscillating_conflicts_and_unscanned_cells_do_not_erase_history():
+    m = _make_global(conflict_confirmations=3)
+    var = np.full((2, 2), .01, np.float32)
+    old = np.full((2, 2), .2, np.float32)
+    m.fuse_snapshot((0, 0), old, var)
+    for k in range(12):
+        result = m.fuse_snapshot((0, 0), np.full((2, 2), -.75 if k % 2 else 1.5, np.float32), var)
+        assert result.corrected_cells == 0
+    for _ in range(10):
+        m.fuse_snapshot((0, 0), np.full((2, 2), -.75, np.float32), var, np.zeros((2, 2), bool))
+    assert np.allclose(m.extract_window((0, 0), 2, 2).elevation_yx, .2, atol=.001)
+
+
+def test_accepted_old_height_resets_conflict_evidence():
+    m = _make_global(conflict_confirmations=3)
+    var = np.full((2, 2), .01, np.float32)
+    old = np.full((2, 2), .2, np.float32)
+    low = np.full((2, 2), -.75, np.float32)
+    m.fuse_snapshot((0, 0), old, var)
+    for _ in range(2): m.fuse_snapshot((0, 0), low, var)
+    m.fuse_snapshot((0, 0), old, var)
+    for _ in range(2):
+        assert m.fuse_snapshot((0, 0), low, var).corrected_cells == 0
+    assert m.fuse_snapshot((0, 0), low, var).corrected_cells == 4
+
+
+def test_conflict_gap_expires_old_votes_and_different_cells_cannot_supply_votes():
+    m = _make_global(conflict_confirmations=3, conflict_max_gap=2)
+    var = np.full((2, 2), .01, np.float32)
+    old = np.full((2, 2), .2, np.float32)
+    low = np.full((2, 2), -.75, np.float32)
+    mask = np.array([[True, False], [False, False]])
+    m.fuse_snapshot((0, 0), old, var)
+    for _ in range(2): m.fuse_snapshot((0, 0), low, var, mask)
+    for _ in range(3): m.fuse_snapshot((0, 0), old, var, ~mask)
+    assert m.fuse_snapshot((0, 0), low, var, mask).corrected_cells == 0
+    assert m.fuse_snapshot((0, 0), low, var, mask).corrected_cells == 0
+    assert m.fuse_snapshot((0, 0), low, var, mask).corrected_cells == 1
+
+
+def test_corrected_height_persists_but_partial_conflict_votes_do_not(tmp_path):
+    args = dict(storage_path=str(tmp_path / 'map.sqlite3'), conflict_confirmations=3)
+    m = _make_global(**args)
+    var = np.full((2, 2), .01, np.float32)
+    old = np.full((2, 2), .2, np.float32)
+    low = np.full((2, 2), -.75, np.float32)
+    m.fuse_snapshot((0, 0), old, var)
+    for _ in range(2): m.fuse_snapshot((0, 0), low, var)
+    m.close()
+    m = _make_global(**args, resume_from_disk=True)
+    for _ in range(2): assert m.fuse_snapshot((0, 0), low, var).corrected_cells == 0
+    assert m.fuse_snapshot((0, 0), low, var).corrected_cells == 4
+    m.close()
+    m = _make_global(**args, resume_from_disk=True)
+    assert np.allclose(m.extract_window((0, 0), 2, 2).elevation_yx, -.75)
+    m.close()
 
 
 def test_far_jump_allocates_only_observed_tiles_not_intermediate_rectangle():
@@ -106,13 +187,13 @@ def test_window_xy_axes_and_gridmap_conversion_use_independent_oracle():
     global_map.fuse_snapshot((0.0, 0.0), natural)
     window = global_map.extract_window((0.0, 0.0), 2.0, 2.0)
 
-    assert np.array_equal(window.elevation_yx, natural)
+    assert np.array_equal(window.elevation_yx, _first_posterior(natural))
     # Natural storage is row=+Y,col=+X. GridMap's matrix axes are row=-X,
     # col=-Y, so this conversion must match the rolling-map publisher.
     expected_grid_map = np.array(
         [[22.0, 12.0], [21.0, 11.0]], dtype=np.float32
     )
-    assert np.array_equal(window.elevation_grid_map_copy(), expected_grid_map)
+    assert np.array_equal(window.elevation_grid_map_copy(), _first_posterior(expected_grid_map))
 
 
 def test_local_window_is_the_same_xy_crop_as_the_global_window():
@@ -127,9 +208,9 @@ def test_local_window_is_the_same_xy_crop_as_the_global_window():
     full = global_map.extract_window((0.0, 0.0), 8.0, 6.0)
     local = global_map.extract_window((1.0, -1.0), 4.0, 2.0)
 
-    expected_full = np.flip(natural.T, axis=(0, 1))
+    expected_full = np.flip(_first_posterior(natural).T, axis=(0, 1))
     natural_local = natural[1:3, 3:7]
-    expected_local = np.flip(natural_local.T, axis=(0, 1))
+    expected_local = np.flip(_first_posterior(natural_local).T, axis=(0, 1))
 
     assert np.array_equal(full.elevation_grid_map_copy(), expected_full)
     assert np.array_equal(local.elevation_grid_map_copy(), expected_local)
@@ -152,7 +233,7 @@ def test_odd_and_mixed_parity_lattices_round_trip(shape):
     restored = global_map.extract_window(center, shape[1], shape[0])
 
     assert restored.elevation_yx.shape == shape
-    assert np.array_equal(restored.elevation_yx, source)
+    assert np.array_equal(restored.elevation_yx, _first_posterior(source))
 
 
 def test_far_negative_tile_boundaries_keep_exact_values():
@@ -168,7 +249,7 @@ def test_far_negative_tile_boundaries_keep_exact_values():
 
     assert set(global_map.all_tile_keys()) == {(-3, -2), (-2, -2), (-3, -1), (-2, -1)}
     restored = global_map.extract_window((-6.0, -3.0), 3.0, 2.0)
-    assert np.array_equal(restored.elevation_yx, source)
+    assert np.array_equal(restored.elevation_yx, _first_posterior(source))
 
 
 def test_float32_center_drift_is_snapped_to_integer_cells():
@@ -201,6 +282,64 @@ def test_empty_window_read_does_not_allocate_tiles():
     assert global_map.tile_count() == 0
 
 
+def test_published_prior_is_zero_with_large_variance_but_not_an_observation():
+    global_map = _make_global(publish_unobserved_prior=True)
+    initial = global_map.extract_window((0, 0), 10, 10)
+    assert (initial.elevation_yx == 0).all()
+    assert (initial.variance_yx == 10000).all()
+    assert (initial.observation_count_yx == 0).all()
+    assert not global_map.has_observations
+    assert global_map.tile_count() == 0
+    height = np.array([[2., np.nan], [np.nan, np.nan]], np.float32)
+    global_map.fuse_snapshot((0, 0), height, np.ones((2, 2), np.float32))
+    updated = global_map.extract_window((0, 0), 2, 2)
+    assert updated.elevation_yx[0, 0] == pytest.approx(2 / 1.0001)
+    assert updated.observation_count_yx[0, 0] == 1
+    assert updated.elevation_yx[1, 1] == 0
+    assert updated.variance_yx[1, 1] == 10000
+    assert updated.observation_count_yx[1, 1] == 0
+
+
+def test_exact_fifteen_metre_view_keeps_coordinates_on_even_lattice():
+    global_map = _make_global(resolution=.04, initial_elevation=-1., publish_unobserved_prior=True)
+    initial = global_map.extract_window((0, 0), 15, 15, exact_size=True)
+    assert initial.elevation_yx.shape == (375, 375)
+    assert initial.length_x == 15 and initial.length_y == 15
+    assert initial.center_x == pytest.approx(.02)
+    assert initial.center_y == pytest.approx(.02)
+    assert (initial.elevation_yx == -1).all()
+    assert (initial.variance_yx == 10000).all()
+    source = np.array([[np.nan, np.nan], [np.nan, -.75]], np.float32)
+    global_map.fuse_snapshot((0, 0), source, np.ones((2, 2), np.float32))
+    updated = global_map.extract_window((0, 0), 15, 15, exact_size=True)
+    assert updated.elevation_yx[187, 187] == pytest.approx(-1 + .25 / 1.0001)
+    assert updated.observation_count_yx[187, 187] == 1
+    assert updated.center_x + (187.5 - 375/2)*.04 == pytest.approx(.02)
+    assert (updated.elevation_yx[updated.observation_count_yx == 0] == -1).all()
+
+
+def test_only_lidar_update_mask_changes_prior_even_when_other_heights_are_finite():
+    global_map = _make_global(publish_unobserved_prior=True)
+    values = np.full((2, 2), 7., np.float32)
+    updated = np.array([[False, False], [False, True]])
+    global_map.fuse_snapshot((0, 0), values, np.ones((2, 2), np.float32), updated)
+    first = global_map.extract_window((0, 0), 2, 2)
+    assert (first.elevation_yx[~updated] == 0).all()
+    assert (first.variance_yx[~updated] == 10000).all()
+    assert (first.observation_count_yx[~updated] == 0).all()
+    measured = first.elevation_yx[1, 1]
+    values[:] = 9.
+    updated[:] = False
+    updated[0, 0] = True
+    global_map.fuse_snapshot((0, 0), values, np.ones((2, 2), np.float32), updated)
+    second = global_map.extract_window((0, 0), 2, 2)
+    assert second.elevation_yx[1, 1] == measured
+    assert second.observation_count_yx[1, 1] == 1
+    assert second.elevation_yx[0, 0] == pytest.approx(9 / 1.0001)
+    assert second.elevation_yx[0, 1] == 0
+    assert second.variance_yx[0, 1] == 10000
+
+
 def test_block_downsampling_preserves_thin_observations_and_block_centers():
     tile = np.full((4, 4), np.nan, dtype=np.float32)
     tile[1, 1] = 2.0  # Not on the old [::2, ::2] sampling lattice.
@@ -221,8 +360,8 @@ def test_extract_window_preserves_old_and_new_distant_areas():
 
     old_window = global_map.extract_window((0.0, 0.0), 2.0, 2.0)
     new_window = global_map.extract_window((6.0, 0.0), 2.0, 2.0)
-    assert np.all(old_window.elevation_yx == 1.0)
-    assert np.all(new_window.elevation_yx == 7.0)
+    assert np.all(old_window.elevation_yx == _first_posterior(1.0))
+    assert np.all(new_window.elevation_yx == _first_posterior(7.0))
 
 
 def test_sqlite_eviction_reload_and_resume(tmp_path):
@@ -248,8 +387,10 @@ def test_sqlite_eviction_reload_and_resume(tmp_path):
         map_frame="map",
     )
     resumed.initialize_lattice((2, 2))
-    assert np.all(resumed.extract_window((0.0, 0.0), 2.0, 2.0).elevation_yx == 1.0)
-    assert np.all(resumed.extract_window((10.0, 10.0), 2.0, 2.0).elevation_yx == 5.0)
+    assert np.all(resumed.extract_window((0.0, 0.0), 2.0, 2.0).elevation_yx == _first_posterior(1.0))
+    assert np.all(resumed.extract_window((10.0, 10.0), 2.0, 2.0).elevation_yx == _first_posterior(5.0))
+    resumed.fuse_snapshot((0.0, 0.0), np.full((2, 2), 1.2, dtype=np.float32))
+    assert np.allclose(resumed.extract_window((0.0, 0.0), 2.0, 2.0).elevation_yx, 2.2 / 2.0001)
     resumed.close()
 
 
@@ -350,9 +491,58 @@ def test_clear_serializes_a_concurrent_fusion_after_the_delete(tmp_path, monkeyp
 
     assert fuse_done.is_set()
     assert np.all(
-        global_map.extract_window((10.0, 10.0), 2.0, 2.0).elevation_yx == 7.0
+        global_map.extract_window((10.0, 10.0), 2.0, 2.0).elevation_yx == _first_posterior(7.0)
     )
     global_map.close()
+
+
+def test_first_measurement_uses_large_prior_without_clipping_it_to_sensor_cap():
+    global_map = _make_global(tile_size_cells=4)
+    assert global_map.initial_elevation == 0.0
+    assert global_map.initial_variance == 10000.0
+    height = np.array([[2.0, np.nan], [np.nan, np.nan]], dtype=np.float32)
+    variance = np.full((2, 2), 100.0, dtype=np.float32)  # R is capped at 4; P0 is not.
+    result = global_map.fuse_snapshot((0.0, 0.0), height, variance)
+    window = global_map.extract_window((0.0, 0.0), 2.0, 2.0)
+    assert result.written_cells == 1  # First observation is not rejected against h0=0.
+    assert window.elevation_yx[0, 0] == pytest.approx(20000.0 / 10004.0)
+    assert window.variance_yx[0, 0] == pytest.approx(40000.0 / 10004.0)
+    assert window.observation_count_yx[0, 0] == 1
+    assert np.isnan(window.elevation_yx[0, 1:]).all()
+    assert np.isnan(window.elevation_yx[1]).all()
+    # Allocated prior-only cells remain numeric in storage but are hidden from HT/RViz.
+    for entry in global_map._tiles.values():
+        unknown = entry.data[global_map._OBSERVATION_COUNT] == 0
+        assert (entry.data[global_map._ELEVATION][unknown] == 0).all()
+        assert (entry.data[global_map._VARIANCE][unknown] == 10000).all()
+    finite_visualized = sum(np.isfinite(data).sum()
+                            for _, data in global_map.take_visualization_tiles(10))
+    assert finite_visualized == 1
+
+
+def test_resume_rejects_changed_prior_and_restores_same_prior(tmp_path):
+    db_path = str(tmp_path / "prior.sqlite3")
+    global_map = _make_global(storage_path=db_path)
+    global_map.fuse_snapshot((0.0, 0.0), np.ones((2, 2), dtype=np.float32))
+    global_map.close()
+    with pytest.raises(ValueError, match="initial_variance"):
+        _make_global(storage_path=db_path, resume_from_disk=True, initial_variance=1000.0)
+    resumed = _make_global(storage_path=db_path, resume_from_disk=True)
+    window = resumed.extract_window((0, 0), 2, 2)
+    assert np.allclose(window.elevation_yx, 1 / 1.0001)
+    assert np.allclose(window.variance_yx, 1 / 1.0001)
+    resumed.close()
+
+
+@pytest.mark.parametrize("parameters", [
+    {"initial_elevation": float("nan")}, {"initial_elevation": float("inf")},
+    {"initial_variance": 0}, {"initial_variance": -1},
+    {"initial_variance": float("nan")}, {"initial_variance": float("inf")},
+    {"initial_variance": 0.001},
+])
+def test_invalid_prior_is_rejected(parameters):
+    with pytest.raises(ValueError, match="initial"):
+        _make_global(**parameters)
 
 
 def test_closed_store_rejects_further_writes():

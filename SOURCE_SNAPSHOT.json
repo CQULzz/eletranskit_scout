@@ -1,0 +1,25 @@
+{
+  "exported_at": "2026-10-30T17:00:07.847900+08:00",
+  "repository": "ele_scouts_kit",
+  "source_root": "/home/agx/ele_scout_kit_github_20260827",
+  "base_commit": "a3b5c3bf4fe48d32311628be58da27efc3d85374",
+  "branch": "feature/autoware-ht-integration-2026-10-23",
+  "working_tree_sources_included": true,
+  "git_history_included": false,
+  "source_file_count": 765,
+  "excluded_local_files": 0,
+  "excluded_roots": [
+    ".deps",
+    "apt-cache",
+    "build",
+    "capture",
+    "install",
+    "log",
+    "recordings",
+    "reports",
+    "validation"
+  ],
+  "extra_files": [
+    "EXPORT_NOTES.md"
+  ]
+}

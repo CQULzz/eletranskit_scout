@@ -35,6 +35,8 @@ class GlobalMapFuseResult:
     written_cells: int
     touched_tiles: int
     rejected_cells: int = 0
+    corrected_cells: int = 0
+    cleared_cells: int = 0
 
 
 @dataclass(frozen=True)
@@ -514,8 +516,16 @@ class GlobalMapAccumulator:
         map_frame: str = "map",
         variance_floor: float = 0.0025,
         variance_ceiling: float = 4.0,
+        initial_elevation: float = 0.0,
+        initial_variance: float = 10000.0,
+        publish_unobserved_prior: bool = False,
         outlier_sigma: float = 3.0,
         max_height_jump: float = 0.30,
+        conflict_confirmations: int = 0,
+        conflict_tolerance: float = 0.10,
+        conflict_max_gap: int = 50,
+        clearance_confirmations: int = 0,
+        clearance_margin: float = 0.15,
     ) -> None:
         if not math.isfinite(resolution) or resolution <= 0.0:
             raise ValueError("Global-map resolution must be finite and positive.")
@@ -536,8 +546,22 @@ class GlobalMapAccumulator:
             )
         if not math.isfinite(outlier_sigma) or outlier_sigma <= 0.0:
             raise ValueError("Global-map outlier sigma must be finite and positive.")
+        if not math.isfinite(initial_elevation):
+            raise ValueError("Global-map initial elevation must be finite.")
+        if not math.isfinite(initial_variance) or initial_variance < variance_floor:
+            raise ValueError("Global-map initial variance must be finite and at least the floor.")
         if not math.isfinite(max_height_jump) or max_height_jump <= 0.0:
             raise ValueError("Global-map maximum height jump must be finite and positive.")
+        if int(conflict_confirmations) != conflict_confirmations or conflict_confirmations < 0:
+            raise ValueError("Conflict confirmations must be a non-negative integer.")
+        if not math.isfinite(conflict_tolerance) or conflict_tolerance <= 0.0:
+            raise ValueError("Conflict tolerance must be finite and positive.")
+        if int(conflict_max_gap) != conflict_max_gap or conflict_max_gap < 1:
+            raise ValueError("Conflict maximum gap must be a positive integer.")
+        if int(clearance_confirmations) != clearance_confirmations or clearance_confirmations < 0:
+            raise ValueError("Clearance confirmations must be a non-negative integer.")
+        if not math.isfinite(clearance_margin) or clearance_margin <= 0:
+            raise ValueError("Clearance margin must be finite and positive.")
 
         self.resolution = float(resolution)
         self.tile_size_cells = int(tile_size_cells)
@@ -545,8 +569,16 @@ class GlobalMapAccumulator:
         self.map_frame = str(map_frame)
         self.variance_floor = float(variance_floor)
         self.variance_ceiling = float(variance_ceiling)
+        self.initial_elevation = float(initial_elevation)
+        self.initial_variance = float(initial_variance)
+        self.publish_unobserved_prior = bool(publish_unobserved_prior)
         self.outlier_sigma = float(outlier_sigma)
         self.max_height_jump = float(max_height_jump)
+        self.conflict_confirmations = int(conflict_confirmations)
+        self.conflict_tolerance = float(conflict_tolerance)
+        self.conflict_max_gap = int(conflict_max_gap)
+        self.clearance_confirmations = int(clearance_confirmations)
+        self.clearance_margin = float(clearance_margin)
         self._spatial_tile_shape = (self.tile_size_cells, self.tile_size_cells)
         self._tile_shape = (
             self._LAYER_COUNT,
@@ -561,6 +593,11 @@ class GlobalMapAccumulator:
         self._lock = threading.RLock()
         self._tiles: "OrderedDict[TileKey, _TileEntry]" = OrderedDict()
         self._pending: Dict[TileKey, Tuple[int, np.ndarray]] = {}
+        # Temporary evidence is deliberately not restored from disk. Each
+        # correction needs fresh, real updates after a restart or cache eviction.
+        # Per tile: candidate mean, mean observation variance, count, revision.
+        self._conflicts: Dict[TileKey, np.ndarray] = {}
+        self._clearance: Dict[TileKey, np.ndarray] = {}
         self._visualization_dirty: "OrderedDict[TileKey, None]" = OrderedDict()
         self._revision = 0
         self._phase_x: Optional[float] = None
@@ -716,13 +753,14 @@ class GlobalMapAccumulator:
         elevation_yx: np.ndarray,
         variance_yx: Optional[np.ndarray] = None,
         updated_yx: Optional[np.ndarray] = None,
+        free_upper_bound_yx: Optional[np.ndarray] = None,
     ) -> GlobalMapFuseResult:
         """Fuse newly observed local cells into probabilistic global tiles."""
 
         with self._operation_lock:
             self._ensure_open()
             return self._fuse_snapshot(
-                center_xy, elevation_yx, variance_yx, updated_yx
+                center_xy, elevation_yx, variance_yx, updated_yx, free_upper_bound_yx
             )
 
     def _fuse_snapshot(
@@ -731,6 +769,7 @@ class GlobalMapAccumulator:
         elevation_yx: np.ndarray,
         variance_yx: Optional[np.ndarray],
         updated_yx: Optional[np.ndarray],
+        free_upper_bound_yx: Optional[np.ndarray],
     ) -> GlobalMapFuseResult:
 
         local = np.asarray(elevation_yx, dtype=np.float32)
@@ -755,6 +794,13 @@ class GlobalMapAccumulator:
                     f"{updated.shape} vs {local.shape}."
                 )
         start_ix, start_iy = self._validate_snapshot_geometry(center_xy, local.shape)
+        if free_upper_bound_yx is None:
+            free_upper_bound = np.full(local.shape, np.inf, dtype=np.float32)
+        else:
+            free_upper_bound = np.asarray(free_upper_bound_yx, dtype=np.float32)
+            if free_upper_bound.shape != local.shape:
+                raise ValueError("Free-space upper bounds must match elevation shape.")
+        free_valid = np.isfinite(free_upper_bound) & (self.clearance_confirmations > 0)
         valid_input = (
             updated
             & np.isfinite(local)
@@ -762,7 +808,7 @@ class GlobalMapAccumulator:
             & (variance > 0.0)
         )
         valid_input_cells = int(valid_input.sum())
-        if valid_input_cells == 0:
+        if valid_input_cells == 0 and not free_valid.any():
             return GlobalMapFuseResult(0, 0, 0)
 
         variance = np.clip(
@@ -778,6 +824,8 @@ class GlobalMapAccumulator:
         max_ty = (end_iy - 1) // self.tile_size_cells
         written_cells = 0
         rejected_cells = 0
+        corrected_cells = 0
+        cleared_cells = 0
         touched: List[TileKey] = []
 
         with self._lock:
@@ -811,11 +859,16 @@ class GlobalMapAccumulator:
                         source_x0 : source_x0 + width,
                     ]
                     count = int(valid.sum())
-                    if count == 0:
+                    free_bound = free_upper_bound[source_y0:source_y0+height, source_x0:source_x0+width]
+                    ray_valid = free_valid[source_y0:source_y0+height, source_x0:source_x0+width]
+                    if count == 0 and not ray_valid.any():
                         continue
 
                     key = (tile_x, tile_y)
-                    entry = self._get_tile_locked(key, create=True)
+                    # Rays alone never allocate unobserved tiles.
+                    entry = self._get_tile_locked(key, create=count > 0)
+                    if entry is None:
+                        continue
                     destination = entry.data[
                         :,
                         dest_y0 : dest_y0 + height,
@@ -831,8 +884,19 @@ class GlobalMapAccumulator:
                         | ~np.isfinite(destination_variance)
                         | (destination_count <= 0.0)
                     )
-                    destination_height[unseen] = source_height[unseen]
-                    destination_variance[unseen] = source_variance[unseen]
+                    # Initialize from the explicit prior, without applying an outlier
+                    # gate against an unobserved cell. The observation variance cap
+                    # applies to R, not to the prior P0 (which may be much larger).
+                    first_variance = source_variance[unseen].astype(np.float64)
+                    first_denominator = self.initial_variance + first_variance
+                    first_gain = self.initial_variance / first_denominator
+                    destination_height[unseen] = self.initial_elevation + first_gain * (
+                        source_height[unseen] - self.initial_elevation
+                    )
+                    # P0*R/(P0+R) avoids cancellation in (1-K)*P0 for large P0.
+                    destination_variance[unseen] = np.maximum(
+                        self.variance_floor, self.initial_variance * first_variance / first_denominator
+                    )
                     destination_count[unseen] = 1.0
                     destination_revision[unseen] = float(revision)
 
@@ -867,10 +931,84 @@ class GlobalMapAccumulator:
                         destination_revision[accepted_existing] = float(revision)
 
                     rejected = existing & ~accepted_existing
-                    accepted = unseen | accepted_existing
+                    corrected = np.zeros(valid.shape, dtype=bool)
+                    if self.conflict_confirmations:
+                        evidence = self._conflicts.get(key)
+                        if evidence is None and rejected.any():
+                            evidence = np.zeros(self._tile_shape, dtype=np.float64)
+                            self._conflicts[key] = evidence
+                        if evidence is not None:
+                            candidate = evidence[:, dest_y0:dest_y0+height, dest_x0:dest_x0+width]
+                            # An accepted observation contradicts the competing
+                            # hypothesis and resets it. Unscanned cells add no vote.
+                            candidate[2, unseen | accepted_existing] = 0
+                            consistent = (
+                                rejected & (candidate[2] > 0)
+                                & (revision - candidate[3] <= self.conflict_max_gap)
+                                & (np.abs(source_height - candidate[0]) <= self.conflict_tolerance)
+                            )
+                            new_candidate = rejected & ~consistent
+                            candidate[0, new_candidate] = source_height[new_candidate]
+                            candidate[1, new_candidate] = source_variance[new_candidate]
+                            candidate[2, new_candidate] = 1
+                            votes = candidate[2, consistent] + 1
+                            candidate[0, consistent] += (
+                                source_height[consistent] - candidate[0, consistent]
+                            ) / votes
+                            candidate[1, consistent] += (
+                                source_variance[consistent] - candidate[1, consistent]
+                            ) / votes
+                            candidate[2, consistent] = votes
+                            candidate[3, rejected] = revision
+                            corrected = rejected & (candidate[2] >= self.conflict_confirmations)
+                            destination_height[corrected] = candidate[0, corrected]
+                            # Rolling posteriors are correlated across frames;
+                            # do not divide their variance by the vote count.
+                            destination_variance[corrected] = np.maximum(
+                                self.variance_floor, candidate[1, corrected]
+                            )
+                            destination_count[corrected] = np.minimum(
+                                destination_count[corrected] + 1, np.float32(16_777_216)
+                            )
+                            destination_revision[corrected] = float(revision)
+                            candidate[2, corrected] = 0
+                    rejected &= ~corrected
+                    corrected_cells += int(corrected.sum())
+                    accepted = unseen | accepted_existing | corrected
+                    cleared = np.zeros(valid.shape, dtype=bool)
+                    evidence = self._clearance.get(key)
+                    if self.clearance_confirmations:
+                        penetrated = (
+                            ray_valid & ~valid
+                            & (destination_count > 0)
+                            & (destination_height > free_bound + self.clearance_margin)
+                        )
+                        if evidence is None and penetrated.any():
+                            evidence = np.zeros((2, *self._spatial_tile_shape), dtype=np.float64)
+                            self._clearance[key] = evidence
+                        if evidence is not None:
+                            votes = evidence[:, dest_y0:dest_y0+height, dest_x0:dest_x0+width]
+                            # Actual endpoints and contradictory free-space rays
+                            # cancel pending clearance; absence of data never votes.
+                            votes[0, valid | (ray_valid & ~penetrated)] = 0
+                            expired = revision - votes[1] > self.conflict_max_gap
+                            votes[0, penetrated & expired] = 0
+                            votes[0, penetrated] += 1
+                            votes[1, penetrated] = revision
+                            cleared = penetrated & (votes[0] >= self.clearance_confirmations)
+                            destination_height[cleared] = self.initial_elevation
+                            destination_variance[cleared] = self.initial_variance
+                            destination_count[cleared] = 0
+                            destination_revision[cleared] = float(revision)
+                            votes[0, cleared] = 0
+                            conflict = self._conflicts.get(key)
+                            if conflict is not None:
+                                conflict[2, dest_y0:dest_y0+height, dest_x0:dest_x0+width][cleared] = 0
+                    clear_count = int(cleared.sum())
+                    cleared_cells += clear_count
                     accepted_count = int(accepted.sum())
                     rejected_cells += int(rejected.sum())
-                    if accepted_count == 0:
+                    if accepted_count == 0 and clear_count == 0:
                         continue
                     entry.revision = revision
                     self._tiles.move_to_end(key)
@@ -878,7 +1016,7 @@ class GlobalMapAccumulator:
                     touched.append(key)
                     written_cells += accepted_count
 
-                    valid_y, valid_x = np.nonzero(accepted)
+                    valid_y, valid_x = np.nonzero(accepted | cleared)
                     self._extend_bounds_locked(
                         overlap_ix0 + int(valid_x.min()),
                         overlap_ix0 + int(valid_x.max()),
@@ -892,6 +1030,8 @@ class GlobalMapAccumulator:
             written_cells=written_cells,
             touched_tiles=len(set(touched)),
             rejected_cells=rejected_cells,
+            corrected_cells=corrected_cells,
+            cleared_cells=cleared_cells,
         )
 
     def extract_window(
@@ -899,18 +1039,20 @@ class GlobalMapAccumulator:
         center_xy: Sequence[float],
         length_x: float,
         length_y: float,
+        exact_size: bool = False,
     ) -> GlobalMapWindow:
         """Materialize a finite dense ROI for GridMap/RViz consumers."""
 
         with self._operation_lock:
             self._ensure_open()
-            return self._extract_window(center_xy, length_x, length_y)
+            return self._extract_window(center_xy, length_x, length_y, exact_size)
 
     def _extract_window(
         self,
         center_xy: Sequence[float],
         length_x: float,
         length_y: float,
+        exact_size: bool = False,
     ) -> GlobalMapWindow:
 
         center = np.asarray(center_xy, dtype=np.float64)
@@ -928,9 +1070,12 @@ class GlobalMapAccumulator:
                 raise RuntimeError("Global-map lattice has not been initialized.")
             expected_x_even = math.isclose(self._phase_x, 0.5)
             expected_y_even = math.isclose(self._phase_y, 0.5)
-            if (cells_x % 2 == 0) != expected_x_even:
+            # RViz can request an exact odd-sized ROI from an even lattice.
+            # Its center then shifts by half a cell; metadata below describes
+            # that shift, preserving the coordinates of every stored cell.
+            if not exact_size and (cells_x % 2 == 0) != expected_x_even:
                 cells_x += 1
-            if (cells_y % 2 == 0) != expected_y_even:
+            if not exact_size and (cells_y % 2 == 0) != expected_y_even:
                 cells_y += 1
 
             center_ix = int(round(center[0] / self.resolution))
@@ -980,6 +1125,17 @@ class GlobalMapAccumulator:
                     ]
                     self._evict_if_needed_locked()
             self._evict_if_needed_locked()
+
+            # A numeric prior is not an observation. Optimistic views expose
+            # its mean/variance while preserving observation_count=0;
+            # strict views continue to mask those cells as unknown.
+            unobserved = output[self._OBSERVATION_COUNT] <= 0.0
+            output[self._ELEVATION][unobserved] = (
+                self.initial_elevation if self.publish_unobserved_prior else np.nan
+            )
+            output[self._VARIANCE][unobserved] = (
+                self.initial_variance if self.publish_unobserved_prior else np.nan
+            )
 
             actual_center_x = (
                 start_ix + self._phase_x - 0.5 + 0.5 * cells_x
@@ -1039,9 +1195,9 @@ class GlobalMapAccumulator:
                     key, _ = self._visualization_dirty.popitem(last=False)
                     entry = self._get_tile_locked(key, create=False)
                     if entry is not None:
-                        result.append(
-                            (key, entry.data[self._ELEVATION].copy())
-                        )
+                        elevation = entry.data[self._ELEVATION].copy()
+                        elevation[entry.data[self._OBSERVATION_COUNT] <= 0.0] = np.nan
+                        result.append((key, elevation))
                     self._evict_if_needed_locked()
             return result
 
@@ -1074,6 +1230,8 @@ class GlobalMapAccumulator:
                 with self._lock:
                     self._tiles.clear()
                     self._pending.clear()
+                    self._conflicts.clear()
+                    self._clearance.clear()
                     self._visualization_dirty.clear()
                     self._min_ix = self._max_ix = None
                     self._min_iy = self._max_iy = None
@@ -1133,6 +1291,8 @@ class GlobalMapAccumulator:
                 entry = _TileEntry(data, revision, revision)
             elif create:
                 data = np.full(self._tile_shape, np.nan, dtype=np.float32)
+                data[self._ELEVATION].fill(self.initial_elevation)
+                data[self._VARIANCE].fill(self.initial_variance)
                 data[self._OBSERVATION_COUNT].fill(0.0)
                 data[self._LAST_UPDATE_REVISION].fill(0.0)
                 entry = _TileEntry(data, 0, 0)
@@ -1153,6 +1313,8 @@ class GlobalMapAccumulator:
             return
         while len(self._tiles) > self.max_tiles_in_memory:
             key, entry = self._tiles.popitem(last=False)
+            self._conflicts.pop(key, None)
+            self._clearance.pop(key, None)
             if entry.revision > entry.persisted_revision:
                 self._enqueue_tile_locked(key, entry)
 
@@ -1204,8 +1366,15 @@ class GlobalMapAccumulator:
             ],
             "variance_floor": self.variance_floor,
             "variance_ceiling": self.variance_ceiling,
+            "initial_elevation": self.initial_elevation,
+            "initial_variance": self.initial_variance,
             "outlier_sigma": self.outlier_sigma,
             "max_height_jump": self.max_height_jump,
+            "conflict_confirmations": self.conflict_confirmations,
+            "conflict_tolerance": self.conflict_tolerance,
+            "conflict_max_gap": self.conflict_max_gap,
+            "clearance_confirmations": self.clearance_confirmations,
+            "clearance_margin": self.clearance_margin,
             "phase_x": self._phase_x,
             "phase_y": self._phase_y,
             "min_ix": self._min_ix,
@@ -1221,6 +1390,8 @@ class GlobalMapAccumulator:
         expected_fusion = {
             "variance_floor": self.variance_floor,
             "variance_ceiling": self.variance_ceiling,
+            "initial_elevation": self.initial_elevation,
+            "initial_variance": self.initial_variance,
             "outlier_sigma": self.outlier_sigma,
             "max_height_jump": self.max_height_jump,
         }
@@ -1233,6 +1404,10 @@ class GlobalMapAccumulator:
                     f"Global tile database metadata mismatch for '{name}': "
                     f"database={actual!r}, requested={expected!r}."
                 )
+        for name in ("conflict_confirmations", "conflict_tolerance", "conflict_max_gap",
+                     "clearance_confirmations", "clearance_margin"):
+            if name in metadata and metadata[name] != getattr(self, name):
+                raise ValueError(f"Global tile database metadata mismatch for '{name}'.")
         phase_x = metadata.get("phase_x")
         phase_y = metadata.get("phase_y")
         for name, phase in (("phase_x", phase_x), ("phase_y", phase_y)):

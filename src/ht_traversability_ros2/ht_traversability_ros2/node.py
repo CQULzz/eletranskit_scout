@@ -18,8 +18,13 @@ import torch
 from .core import (
     RECEPTIVE_FIELD,
     build_conservative_traversability_layer,
+    build_direction_cost_layers,
     build_output_layers,
+    embed_center,
     nearest_fill_nan,
+    prepare_observation_height,
+    add_unobserved_prior_layers,
+    bounded_median_height,
     valid_window_ratio,
     validate_direction_order,
 )
@@ -33,6 +38,10 @@ class HTTraversabilityNode(Node):
 
         self.declare_parameter("input_topic", "/elevation_mapping_node/elevation_map_filter")
         self.declare_parameter("input_layer", "inpaint")
+        self.declare_parameter("unobserved_is_free", False)
+        self.declare_parameter("height_median_kernel", 1)
+        self.declare_parameter("height_median_max_delta", .04)
+        self.declare_parameter("height_median_max_relief", .12)
         self.declare_parameter("output_topic", "/ht_traversability/traversability_8dir")
         self.declare_parameter("model_path", "")
         self.declare_parameter("device", "cuda")
@@ -43,6 +52,11 @@ class HTTraversabilityNode(Node):
         self.declare_parameter("min_valid_ratio", 0.70)
         self.declare_parameter("direction_channel_order", [0, 1, 2, 3, 4, 5, 6, 7])
         self.declare_parameter("aggregate_only", False)
+        self.declare_parameter("publish_direction_probabilities", True)
+        self.declare_parameter("publish_direction_costmaps", False)
+        self.declare_parameter("publish_merged_traversability", False)
+        self.declare_parameter("publish_valid_layer", True)
+        self.declare_parameter("publish_height_layer", True)
         self.declare_parameter("traversability_threshold", 0.5)
         self.declare_parameter("warmup_rows", 250)
         self.declare_parameter("warmup_cols", 250)
@@ -56,6 +70,17 @@ class HTTraversabilityNode(Node):
         self.inference_fps = float(self.get_parameter("inference_fps").value)
         self.min_valid_ratio = float(self.get_parameter("min_valid_ratio").value)
         self.aggregate_only = bool(self.get_parameter("aggregate_only").value)
+        self.publish_direction_probabilities = bool(
+            self.get_parameter("publish_direction_probabilities").value
+        )
+        self.publish_direction_costmaps = bool(
+            self.get_parameter("publish_direction_costmaps").value
+        )
+        self.publish_merged_traversability = bool(
+            self.get_parameter("publish_merged_traversability").value
+        )
+        self.publish_valid_layer = bool(self.get_parameter("publish_valid_layer").value)
+        self.publish_height_layer = bool(self.get_parameter("publish_height_layer").value)
         self.traversability_threshold = float(
             self.get_parameter("traversability_threshold").value
         )
@@ -89,14 +114,19 @@ class HTTraversabilityNode(Node):
         self._last_error_text: Optional[str] = None
         self._last_error_time = 0.0
         self.get_logger().info(
-            "Ready: input=%s layer=%s output=%s device=%s fps=%.2f mode=%s threshold=%.3f"
+            "Ready: input=%s layer=%s output=%s device=%s fps=%.2f "
+            "probabilities=%s costs=%s merged=%s valid=%s height=%s threshold=%.3f"
             % (
                 self.input_topic,
                 self.input_layer,
                 self.output_topic,
                 self.device,
                 self.inference_fps,
-                "aggregate_only" if self.aggregate_only else "eight_direction",
+                self.publish_direction_probabilities,
+                self.publish_direction_costmaps,
+                self.publish_merged_traversability,
+                self.publish_valid_layer,
+                self.publish_height_layer,
                 self.traversability_threshold,
             )
         )
@@ -201,7 +231,9 @@ class HTTraversabilityNode(Node):
         if self.inference_fps > 0.0 and now < self._next_inference_time:
             return
         if self.inference_fps > 0.0:
-            self._next_inference_time = now + 1.0 / self.inference_fps
+            # Advance the cadence rather than restarting it at each arrival.
+            # Otherwise slightly early 10 Hz frames get dropped into a 5 Hz pattern.
+            self._next_inference_time = max(self._next_inference_time + 1.0 / self.inference_fps, now)
 
         started = time.perf_counter()
         try:
@@ -218,7 +250,20 @@ class HTTraversabilityNode(Node):
                     f"{RECEPTIVE_FIELD}x{RECEPTIVE_FIELD} receptive field"
                 )
 
-            filled, finite_mask = nearest_fill_nan(height)
+            observed = None
+            if self.get_parameter("unobserved_is_free").value:
+                if "observation_count" not in message.layers:
+                    raise ValueError("Optimistic prior requires observation_count")
+                count = decode_layer("observation_count", message.data[
+                    list(message.layers).index("observation_count")])
+                filled, finite_mask = prepare_observation_height(height, count)
+                observed = finite_mask
+            else:
+                filled, finite_mask = nearest_fill_nan(height)
+            filled = bounded_median_height(filled, finite_mask,
+                int(self.get_parameter("height_median_kernel").value),
+                float(self.get_parameter("height_median_max_delta").value),
+                float(self.get_parameter("height_median_max_relief").value))
             support_ratio = valid_window_ratio(finite_mask, RECEPTIVE_FIELD)
             valid_output = support_ratio >= self.min_valid_ratio
 
@@ -238,20 +283,41 @@ class HTTraversabilityNode(Node):
                 probabilities = probabilities[list(self.direction_order)]
                 probabilities_np = probabilities.cpu().numpy().astype(np.float32, copy=False)
 
-            if self.aggregate_only:
-                layers = {
-                    "ht_traversable": build_conservative_traversability_layer(
+            # Keep aggregate_only as a backward-compatible legacy switch. New
+            # deployments should use the explicit publish_* parameters below.
+            publish_probabilities = (
+                self.publish_direction_probabilities and not self.aggregate_only
+            )
+            publish_merged = self.publish_merged_traversability or self.aggregate_only
+            layers: dict[str, np.ndarray] = {}
+            if publish_probabilities:
+                layers.update(build_output_layers(probabilities_np, valid_output, height.shape))
+            if self.publish_direction_costmaps:
+                layers.update(
+                    build_direction_cost_layers(
                         probabilities_np,
                         valid_output,
                         height.shape,
                         self.traversability_threshold,
                     )
-                }
-            else:
-                layers = build_output_layers(
-                    probabilities_np, valid_output, height.shape
                 )
-            layers["ht_height"] = height.astype(np.float32, copy=False)
+            if publish_merged:
+                layers["ht_traversable"] = build_conservative_traversability_layer(
+                    probabilities_np,
+                    valid_output,
+                    height.shape,
+                    self.traversability_threshold,
+                )
+            if self.publish_valid_layer and "ht_valid" not in layers:
+                layers["ht_valid"] = embed_center(
+                    valid_output.astype(np.float32), height.shape, fill=0.0
+                )
+            if self.publish_height_layer:
+                layers["ht_height"] = height.astype(np.float32, copy=False)
+            if observed is not None:
+                add_unobserved_prior_layers(layers, observed)
+            if not layers:
+                raise RuntimeError("HT output has no enabled layers")
             self.publisher.publish(self._make_output_message(message, layers))
             self._last_error_text = None
 
@@ -261,7 +327,7 @@ class HTTraversabilityNode(Node):
                 self.get_logger().info(
                     f"HT inference {elapsed_ms:.1f} ms, grid={height.shape}, "
                     f"valid_output={valid_percent:.1f}% "
-                    f"mode={'aggregate_only' if self.aggregate_only else 'eight_direction'}"
+                    f"layers={list(layers)}"
                 )
                 self._last_status_time = now
         except Exception as exc:  # Keep the mapping pipeline alive on malformed frames.

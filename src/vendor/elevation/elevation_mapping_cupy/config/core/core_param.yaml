@@ -15,6 +15,9 @@
     global_map_max_tiles_in_memory: 256
     global_map_storage_path: '~/.ros/elevation_mapping_cupy/global_tiles.sqlite3'
     global_map_resume_from_disk: false
+    global_map_initial_elevation: 0.0             # Prior mean [m], not an observed flat surface.
+    global_map_initial_variance: 10000.0          # Prior P0 [m^2], independent of observation variance cap.
+    global_map_publish_unobserved_prior: false
     # GridMap is necessarily finite: this is only a high-resolution ROI view.
     # The MarkerArray tile topic above visualizes all allocated global tiles.
     global_map_view_length_x: 30.0

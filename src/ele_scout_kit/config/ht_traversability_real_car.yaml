@@ -5,9 +5,15 @@
     input_layer: elevation
     output_topic: /ht_traversability/global_local
 
-    # Publish a conservative aggregate: all eight directional probabilities
-    # must pass the threshold. One failed direction makes the cell red (0).
-    aggregate_only: true
+    # Live output: eight binary directional costs (0=free, 1=blocked), thresholded
+    # from probability, plus one conservative binary result. Do not transmit the duplicate
+    # directional probability or height layers in the bandwidth-sensitive path.
+    aggregate_only: false
+    publish_direction_probabilities: false
+    publish_direction_costmaps: true
+    publish_merged_traversability: true
+    publish_valid_layer: true
+    publish_height_layer: false
     # Calibrated on the 2026-08-31 live sample. Keep this configurable because
     # the final operational threshold still requires labelled terrain data.
     traversability_threshold: 0.15

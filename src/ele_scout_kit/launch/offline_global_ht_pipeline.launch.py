@@ -70,6 +70,10 @@ def generate_launch_description():
                 # comparison run. The recorder derives the conservative
                 # binary result from the exact same inference frame.
                 "aggregate_only": False,
+                # The diagnostic recorder consumes the raw directional
+                # probabilities. Keep them explicit even though the live
+                # configuration suppresses these duplicate layers.
+                "publish_direction_probabilities": True,
             },
         ],
     )

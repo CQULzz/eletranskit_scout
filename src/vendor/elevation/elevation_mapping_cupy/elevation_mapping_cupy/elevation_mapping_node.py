@@ -44,7 +44,6 @@ from elevation_mapping_cupy.global_map import (
     downsample_elevation_blocks,
 )
 from elevation_mapping_cupy.gridmap_utils import encode_layer_to_multiarray, decode_multiarray_to_rows_cols
-from elevation_mapping_cupy.pose_motion import PoseMotionDetector
 
 PDC_DATATYPE = {
     "1": np.int8,
@@ -238,23 +237,10 @@ class ElevationMappingNode(Node):
         self._pointcloud_process_counter = 0
         self._image_process_counter = 0
         self._map = ElevationMap(self.param)
-        self._drift_motion_detector = PoseMotionDetector(
-            self.position_lowpass_alpha,
-            self.orientation_lowpass_alpha,
-        )
         self._map_data = np.zeros(
             (self._map.cell_n - 2, self._map.cell_n - 2), dtype=np.float32
         )
         self.get_logger().info(f"Initialized map with length: {self._map.map_length}, resolution: {self._map.resolution}, cells: {self._map.cell_n}")
-        if self.param.enable_drift_compensation:
-            self.get_logger().info(
-                "Z-drift compensation enabled: "
-                f"position threshold={self.param.position_noise_thresh:.4f} m, "
-                f"orientation threshold={self.param.orientation_noise_thresh:.4f} rad, "
-                f"minimum inliers>{self.param.min_height_drift_cnt}, "
-                f"gain={self.param.drift_compensation_alpha:.3f}, "
-                f"maximum mean error={self.param.max_drift:.3f} m."
-            )
         self._global_map = None
         self._global_map_data = None
         self._global_map_variance_data = None
@@ -279,6 +265,8 @@ class ElevationMappingNode(Node):
         self._global_snapshot_skipped_count = 0
         self._global_fused_cell_count = 0
         self._global_rejected_cell_count = 0
+        self._global_corrected_cell_count = 0
+        self._global_cleared_cell_count = 0
         self._global_fusion_last_log_time = 0.0
         if self.enable_global_map:
             self._global_map = GlobalMapAccumulator(
@@ -290,8 +278,16 @@ class ElevationMappingNode(Node):
                 map_frame=self.map_frame,
                 variance_floor=self.global_map_fusion_variance_floor,
                 variance_ceiling=self.global_map_fusion_variance_ceiling,
+                initial_elevation=self.global_map_initial_elevation,
+                initial_variance=self.global_map_initial_variance,
+                publish_unobserved_prior=self.global_map_publish_unobserved_prior,
                 outlier_sigma=self.global_map_outlier_sigma,
                 max_height_jump=self.global_map_max_height_jump,
+                conflict_confirmations=self.global_map_conflict_confirmations,
+                conflict_tolerance=self.global_map_conflict_tolerance,
+                conflict_max_gap=self.global_map_conflict_max_gap,
+                clearance_confirmations=self.global_map_clearance_confirmations,
+                clearance_margin=self.global_map_clearance_margin,
             )
             local_shape = (self._map.cell_n - 2, self._map.cell_n - 2)
             self._global_map.initialize_lattice(local_shape)
@@ -407,8 +403,17 @@ class ElevationMappingNode(Node):
             'global_map_snapshot_buffer_count': 2,
             'global_map_fusion_variance_floor': 0.0025,
             'global_map_fusion_variance_ceiling': 4.0,
+            'global_map_initial_elevation': 0.0,
+            'global_map_initial_variance': 10000.0,
+            'global_map_publish_unobserved_prior': False,
             'global_map_outlier_sigma': 3.0,
             'global_map_max_height_jump': 0.30,
+            'global_map_conflict_confirmations': 0,
+            'global_map_conflict_tolerance': 0.10,
+            'global_map_conflict_max_gap': 50,
+            'global_map_clearance_confirmations': 0,
+            'global_map_clearance_margin': 0.15,
+            'ray_origin_frame': '',
             'global_map_flush_fps': 1.0,
             'global_map_tiles_publish_fps': 2.0,
             'global_map_tiles_per_message': 8,
@@ -448,9 +453,34 @@ class ElevationMappingNode(Node):
         self.global_map_outlier_sigma = float(
             self.get_parameter('global_map_outlier_sigma').value
         )
+        self.global_map_initial_elevation = float(
+            self.get_parameter('global_map_initial_elevation').value
+        )
+        self.global_map_initial_variance = float(
+            self.get_parameter('global_map_initial_variance').value
+        )
+        self.global_map_publish_unobserved_prior = bool(
+            self.get_parameter('global_map_publish_unobserved_prior').value
+        )
         self.global_map_max_height_jump = float(
             self.get_parameter('global_map_max_height_jump').value
         )
+        self.global_map_conflict_confirmations = int(
+            self.get_parameter('global_map_conflict_confirmations').value
+        )
+        self.global_map_conflict_tolerance = float(
+            self.get_parameter('global_map_conflict_tolerance').value
+        )
+        self.global_map_conflict_max_gap = int(
+            self.get_parameter('global_map_conflict_max_gap').value
+        )
+        self.global_map_clearance_confirmations = int(
+            self.get_parameter('global_map_clearance_confirmations').value
+        )
+        self.global_map_clearance_margin = float(
+            self.get_parameter('global_map_clearance_margin').value
+        )
+        self.ray_origin_frame = str(self.get_parameter('ray_origin_frame').value)
         self.global_map_flush_fps = float(self.get_parameter('global_map_flush_fps').value)
         self.global_map_tiles_publish_fps = float(self.get_parameter('global_map_tiles_publish_fps').value)
         self.global_map_tiles_per_message = int(self.get_parameter('global_map_tiles_per_message').value)
@@ -499,6 +529,11 @@ class ElevationMappingNode(Node):
             )
         if not math.isfinite(self.global_map_outlier_sigma) or self.global_map_outlier_sigma <= 0.0:
             raise ValueError('global_map_outlier_sigma must be finite and positive.')
+        if not math.isfinite(self.global_map_initial_elevation):
+            raise ValueError('global_map_initial_elevation must be finite.')
+        if (not math.isfinite(self.global_map_initial_variance)
+                or self.global_map_initial_variance < self.global_map_fusion_variance_floor):
+            raise ValueError('global_map_initial_variance must be finite and at least the floor.')
         if not math.isfinite(self.global_map_max_height_jump) or self.global_map_max_height_jump <= 0.0:
             raise ValueError('global_map_max_height_jump must be finite and positive.')
         self_filter_defaults = {
@@ -789,11 +824,6 @@ class ElevationMappingNode(Node):
             f"/{self.get_name()}/received_pointcloud_count",
             10,
         )
-        self._drift_compensation_publisher = self.create_publisher(
-            Float32MultiArray,
-            f"/{self.get_name()}/drift_compensation_status",
-            10,
-        )
 
         for pub_key, pub_config in self.my_publishers.items():
             topic_name = f"/{self.get_name()}/{pub_key}"
@@ -1056,26 +1086,29 @@ class ElevationMappingNode(Node):
                     elevation,
                     variance,
                     updated,
-                ) = self._map.materialize_elevation_snapshot(slot, copy_stream)
+                    clearance,
+                ) = self._map.materialize_elevation_snapshot(slot, copy_stream, include_clearance=True)
                 with self._global_fusion_control_lock:
                     if slot.generation != self._global_map_generation:
                         continue
                     started = time.perf_counter()
                     result = self._global_map.fuse_snapshot(
-                        center[:2], elevation, variance, updated
+                        center[:2], elevation, variance, updated, clearance
                     )
                     elapsed_ms = (time.perf_counter() - started) * 1000.0
-                if result.written_cells > 0:
+                if result.written_cells > 0 or result.cleared_cells > 0:
                     with self._global_map_state_lock:
                         self._global_map_stamp = slot.stamp
                     self._global_snapshot_fused_count += 1
                 self._global_fused_cell_count += result.written_cells
                 self._global_rejected_cell_count += result.rejected_cells
+                self._global_corrected_cell_count += result.corrected_cells
+                self._global_cleared_cell_count += result.cleared_cells
                 now = time.monotonic()
                 if now - self._global_fusion_last_log_time >= 5.0:
                     self.get_logger().info(
                         "Async global fusion %.1f ms; captured=%d fused=%d "
-                        "replaced=%d skipped=%d accepted_cells=%d rejected_cells=%d"
+                        "replaced=%d skipped=%d accepted_cells=%d rejected_cells=%d corrected_cells=%d cleared_cells=%d"
                         % (
                             elapsed_ms,
                             self._global_snapshot_captured_count,
@@ -1084,6 +1117,8 @@ class ElevationMappingNode(Node):
                             self._global_snapshot_skipped_count,
                             self._global_fused_cell_count,
                             self._global_rejected_cell_count,
+                            self._global_corrected_cell_count,
+                            self._global_cleared_cell_count,
                         )
                     )
                     self._global_fusion_last_log_time = now
@@ -1134,16 +1169,20 @@ class ElevationMappingNode(Node):
                 elevation,
                 variance,
                 updated,
+                clearance,
             ) = self._map.export_global_observation(
                 self._global_map_data,
                 self._global_map_variance_data,
                 self._global_map_updated_data,
+                include_clearance=True,
             )
             result = self._global_map.fuse_snapshot(
-                center[:2], elevation, variance, updated
+                center[:2], elevation, variance, updated, clearance
             )
             self._global_fused_cell_count += result.written_cells
             self._global_rejected_cell_count += result.rejected_cells
+            self._global_corrected_cell_count += result.corrected_cells
+            self._global_cleared_cell_count += result.cleared_cells
         except Exception as exc:
             self._report_global_map_failure("accumulation", exc)
             return False
@@ -1154,7 +1193,7 @@ class ElevationMappingNode(Node):
             else self.get_clock().now().to_msg()
         )
         self._global_map_pending_stamp = None
-        return result.written_cells > 0
+        return result.written_cells > 0 or result.cleared_cells > 0
 
     def _report_global_map_failure(self, operation: str, exc: Exception) -> None:
         """Stop global expansion loudly while allowing the local map to continue."""
@@ -1184,7 +1223,7 @@ class ElevationMappingNode(Node):
         if self._global_map_failed:
             return
         if not force:
-            if not self._global_map.has_observations:
+            if not self._global_map.has_observations and not self.global_map_publish_unobserved_prior:
                 return
             if self._global_map_publisher.get_subscription_count() == 0:
                 return
@@ -1204,6 +1243,7 @@ class ElevationMappingNode(Node):
                 view_center,
                 self.global_map_view_length_x,
                 self.global_map_view_length_y,
+                exact_size=True,
             )
         except Exception as exc:
             self._report_global_map_failure("window extraction", exc)
@@ -1237,7 +1277,8 @@ class ElevationMappingNode(Node):
         self.accumulate_global_map()
         if self._global_map_failed:
             return
-        if not force and not self._global_map.has_observations:
+        if (not force and not self._global_map.has_observations
+                and not self.global_map_publish_unobserved_prior):
             return
         if not force and self._global_map_local_publisher.get_subscription_count() == 0:
             return
@@ -1948,44 +1989,15 @@ class ElevationMappingNode(Node):
             t_np = np.array([t.x, t.y, t.z], dtype=np.float32)
             R = quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3].astype(np.float32)
 
-        position_motion, orientation_motion = self._drift_motion_detector.update(
-            sub_key,
-            t_np,
-            R,
-        )
-        self._map.input_pointcloud(
-            pts,
-            channels,
-            R,
-            t_np,
-            position_motion,
-            orientation_motion,
-        )
-        drift_status = self._map.get_drift_compensation_status()
-        drift_message = Float32MultiArray()
-        drift_message.layout.dim.append(
-            MAD(
-                label=(
-                    "enabled,motion_gate_open,position_motion_m,"
-                    "orientation_motion_rad,inlier_count,mean_error_m,"
-                    "applied_correction_m,cumulative_correction_m,applied"
-                ),
-                size=9,
-                stride=9,
-            )
-        )
-        drift_message.data = [
-            float(drift_status["enabled"]),
-            float(drift_status["motion_gate_open"]),
-            float(position_motion),
-            float(orientation_motion),
-            float(drift_status["inlier_count"]),
-            float(drift_status["mean_error_m"]),
-            float(drift_status["applied_correction_m"]),
-            float(drift_status["cumulative_correction_m"]),
-            float(drift_status["applied"]),
-        ]
-        self._drift_compensation_publisher.publish(drift_message)
+        ray_origin = None
+        if self.ray_origin_frame and self.ray_origin_frame != frame_sensor_id:
+            sensor_tf = self.safe_lookup_transform(
+                self.map_frame, self.ray_origin_frame, msg.header.stamp)
+            if sensor_tf is None:
+                return
+            sensor_t = sensor_tf.transform.translation
+            ray_origin = np.array([sensor_t.x, sensor_t.y, sensor_t.z], dtype=np.float32)
+        self._map.input_pointcloud(pts, channels, R, t_np, 0, 0, ray_origin=ray_origin)
         self._pointcloud_process_counter += 1
         if self.enable_global_map:
             self._mark_global_map_dirty(msg.header.stamp)

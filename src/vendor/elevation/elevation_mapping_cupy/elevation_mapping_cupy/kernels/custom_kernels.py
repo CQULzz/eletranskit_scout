@@ -171,8 +171,8 @@ def add_points_kernel(
     enable_visibility_cleanup=True,
 ):
     add_points_kernel = cp.ElementwiseKernel(
-        in_params="raw U center_x, raw U center_y, raw U R, raw U t, raw U map, raw U norm_map",
-        out_params="raw U p, raw T newmap, raw T visibility",
+        in_params="raw U center_x, raw U center_y, raw U R, raw U t, raw U origin, raw U map, raw U norm_map",
+        out_params="raw U p, raw T newmap, raw T visibility, raw T ray_clearance",
         preamble=map_utils(
             resolution,
             width,
@@ -223,16 +223,16 @@ def add_points_kernel(
             }
             if (${enable_visibility_cleanup}) {
                 float ray_x, ray_y, ray_z;
-                float ray_length = ray_vector(t[0], t[1], t[2], x, y, z, ray_x, ray_y, ray_z);
+                float ray_length = ray_vector(origin[0], origin[1], origin[2], x, y, z, ray_x, ray_y, ray_z);
                 ray_length = fminf(ray_length, (float)${max_ray_length});
-                float end_x = t[0] + ray_x * ray_length;
-                float end_y = t[1] + ray_y * ray_length;
-                float end_z = t[2] + ray_z * ray_length;
+                float end_x = origin[0] + ray_x * ray_length;
+                float end_y = origin[1] + ray_y * ray_length;
+                float end_z = origin[2] + ray_z * ray_length;
                 float start_grid_x = (
-                    (t[0] - center_x[0]) / ${resolution} + 0.5f * (${width} - 1) + 0.5f
+                    (origin[0] - center_x[0]) / ${resolution} + 0.5f * (${width} - 1) + 0.5f
                 );
                 float start_grid_y = (
-                    (t[1] - center_y[0]) / ${resolution} + 0.5f * (${height} - 1) + 0.5f
+                    (origin[1] - center_y[0]) / ${resolution} + 0.5f * (${height} - 1) + 0.5f
                 );
                 float end_grid_x = (
                     (end_x - center_x[0]) / ${resolution} + 0.5f * (${width} - 1) + 0.5f
@@ -283,7 +283,11 @@ def add_points_kernel(
                     int nidx = cell_y * ${width} + cell_x;
                     float exit = fminf(fminf(next_x, next_y), 1.0f);
                     float sample = 0.5f * (entry + exit);
-                    U nz = t[2] + (end_z - t[2]) * sample;
+                    U nz = origin[2] + (end_z - origin[2]) * sample;
+
+                    // Export geometric free-space before local age/normal
+                    // heuristics. Endpoint priority is applied after all rays.
+                    atomic_min_float(&ray_clearance[nidx], nz);
 
                     U nmap_h = map[get_map_idx(nidx, 0)];
                     U nmap_v = map[get_map_idx(nidx, 1)];

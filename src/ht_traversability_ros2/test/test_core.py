@@ -3,12 +3,52 @@ import pytest
 
 from ht_traversability_ros2.core import (
     build_conservative_traversability_layer,
+    build_direction_cost_layers,
     build_output_layers,
     embed_center,
     nearest_fill_nan,
+    prepare_observation_height,
+    add_unobserved_prior_layers,
     valid_window_ratio,
     validate_direction_order,
 )
+
+
+def test_initial_prior_has_free_costs_without_fabricated_model_scores():
+    height = np.zeros((55, 55), np.float32)
+    filled, observed = prepare_observation_height(height, np.zeros_like(height))
+    assert not observed.any()
+    assert (filled == 0).all()
+    layers = {"ht_dir_0": np.full_like(height, np.nan),
+              "ht_cost_dir_0": np.full_like(height, np.nan)}
+    add_unobserved_prior_layers(layers, observed)
+    assert np.isnan(layers["ht_dir_0"]).all()
+    assert (layers["ht_cost_dir_0"] == 0).all()
+    assert (layers["ht_prior_free"] == 1).all()
+    assert (layers["ht_observed"] == 0).all()
+
+
+def test_unobserved_minus_one_height_is_preserved_for_empty_model_context():
+    height = np.full((55, 55), -1., np.float32)
+    filled, observed = prepare_observation_height(height, np.zeros_like(height))
+    assert (filled == -1).all()
+    assert not observed.any()
+
+
+def test_prior_zero_is_not_used_as_a_real_height_in_model_context():
+    height = np.zeros((55, 55), np.float32)
+    count = np.zeros_like(height)
+    height[20, 20], count[20, 20] = 2., 1.
+    filled, observed = prepare_observation_height(height, count)
+    assert (filled == 2).all()
+    assert observed.sum() == 1
+    layers = {"ht_cost_dir_0": np.ones_like(height)}
+    add_unobserved_prior_layers(layers, observed)
+    assert layers["ht_cost_dir_0"][20, 20] == 1
+    assert (layers["ht_cost_dir_0"][~observed] == 0).all()
+    count[0, 0] = np.nan
+    with pytest.raises(ValueError, match="observation_count"):
+        prepare_observation_height(height, count)
 
 
 def test_valid_window_ratio_shape_and_value():
@@ -76,6 +116,35 @@ def test_direction_order_validation():
     assert validate_direction_order(range(8)) == tuple(range(8))
     with pytest.raises(ValueError, match="permutation"):
         validate_direction_order([0] * 8)
+
+
+def test_direction_cost_layers_are_binary_and_preserve_unknown():
+    probabilities = np.stack(
+        [np.full((2, 3), index / 10.0, dtype=np.float32) for index in range(8)]
+    )
+    valid = np.ones((2, 3), dtype=bool)
+    valid[0, 0] = False
+
+    layers = build_direction_cost_layers(probabilities, valid, (4, 5), threshold=0.5)
+
+    assert list(layers) == [f"ht_cost_dir_{index}" for index in range(8)]
+    for index in range(8):
+        inner = layers[f"ht_cost_dir_{index}"][1:3, 1:4]
+        assert np.isnan(inner[0, 0])
+        np.testing.assert_equal(
+            inner[valid], (probabilities[index][valid] < 0.5).astype(np.float32)
+        )
+        finite = inner[np.isfinite(inner)]
+        assert set(np.unique(finite)).issubset({0.0, 1.0})
+
+
+def test_direction_cost_threshold_equality_is_free():
+    probabilities = np.full((8, 1, 2), 0.5, dtype=np.float32)
+    probabilities[:, 0, 0] = np.nextafter(np.float32(0.5), np.float32(0.0))
+    layers = build_direction_cost_layers(
+        probabilities, np.ones((1, 2), dtype=bool), (1, 2), threshold=0.5
+    )
+    np.testing.assert_equal(layers["ht_cost_dir_0"], [[1.0, 0.0]])
 
 
 def test_conservative_layer_requires_all_eight_directions_at_threshold():
